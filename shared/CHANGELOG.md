@@ -24,6 +24,15 @@ See the `release/v2` branch.
 - Add additional hash functions to the hash syscall.
 - Add blake2b512
 - Change TokenAmount from a type alias to a struct wrapping BigInt
+<<<<<<< HEAD
+=======
+
+(lots of breaking changes)
+
+## 0.9.0
+
+- Update proofs.
+>>>>>>> 74057e1 (chore: release v2 alpha (#815))
 
 ## 0.8.0 [2022-06-13]
 
@@ -60,7 +69,7 @@ BREAKING: Switch syscall struct alignment: https://github.com/filecoin-project/f
 Actors built against this new version of fvm_shared will be incompatible with prior FVM versions,
 and vice-versa.
 
-- Added `Display` trait to `Type` for error printing. 
+- Added `Display` trait to `Type` for error printing.
 - Added _cfg = "testing"_ on `Default` trait for `Message` structure.
 
 ## 0.5.1  [2022-04-11]
