@@ -22,6 +22,10 @@ See `release/v2`
     - blake2b512
 - API BREAKING: add gas charges to the execution trace.
 
+## 2.0.0-alpha.1
+
+Bump major version for breaking changes.
+
 ## 1.1.0 [2022-06-27]
 
 - debug execution: implement actor redirects in engine
