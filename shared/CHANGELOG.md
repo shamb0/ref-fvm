@@ -24,15 +24,6 @@ See the `release/v2` branch.
 - Add additional hash functions to the hash syscall.
 - Add blake2b512
 - Change TokenAmount from a type alias to a struct wrapping BigInt
-<<<<<<< HEAD
-=======
-
-(lots of breaking changes)
-
-## 0.9.0
-
-- Update proofs.
->>>>>>> 74057e1 (chore: release v2 alpha (#815))
 
 ## 0.8.0 [2022-06-13]
 
