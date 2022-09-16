@@ -214,7 +214,7 @@ where
     /// assert_eq!(map.get(&2).unwrap(), None);
     /// ```
     #[inline]
-    pub fn get<'r, H, Q>(&self, k: &Q, hash_algo: &'r mut H) -> Result<Option<&V>, Error>
+    pub fn get<H, Q>(&self, k: &Q, hash_algo: &mut H) -> Result<Option<&V>, Error>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
@@ -250,7 +250,7 @@ where
     /// assert_eq!(map.contains_key(&2).unwrap(), false);
     /// ```
     #[inline]
-    pub fn contains_key<'r, H, Q>(&mut self, k: &Q, hash_algo: &'r mut H) -> Result<bool, Error>
+    pub fn contains_key<H, Q>(&self, k: &Q, hash_algo: &mut H) -> Result<bool, Error>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
@@ -282,7 +282,7 @@ where
     /// assert_eq!(map.delete(&1).unwrap(), Some((1, "a".to_string())));
     /// assert_eq!(map.delete(&1).unwrap(), None);
     /// ```
-    pub fn delete<'r, H, Q>(&mut self, k: &Q, hash_algo: &'r mut H) -> Result<Option<(K, V)>, Error>
+    pub fn delete<H, Q>(&mut self, k: &Q, hash_algo: &mut H) -> Result<Option<(K, V)>, Error>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
