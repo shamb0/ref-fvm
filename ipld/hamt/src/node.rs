@@ -89,7 +89,7 @@ where
         V: PartialEq,
         H: HashAlgorithm,
     {
-        let hash = hash_algo.hash(&key);
+        let hash = hash_algo.rt_hash(&key);
         self.modify_value(
             &mut HashBits::new(&hash),
             bit_width,
@@ -135,7 +135,7 @@ where
         BS: Blockstore,
         H: HashAlgorithm,
     {
-        let hash = hash_algo.hash(k);
+        let hash = hash_algo.rt_hash(k);
         self.rm_value(&mut HashBits::new(&hash), bit_width, 0, k, store)
     }
 
@@ -194,7 +194,7 @@ where
         Q: Eq + Hash + ?Sized,
         H: HashAlgorithm,
     {
-        let hash = hash_algo.hash(q);
+        let hash = hash_algo.rt_hash(q);
         self.get_value(&mut HashBits::new(&hash), bit_width, 0, q, store)
     }
 
@@ -345,7 +345,7 @@ where
                     )?;
                     let kvs = std::mem::take(vals);
                     for p in kvs.into_iter() {
-                        let hash = hash_algo.hash(p.key());
+                        let hash = hash_algo.rt_hash(p.key());
                         sub.modify_value(
                             &mut HashBits::new_at_index(&hash, consumed),
                             bit_width,

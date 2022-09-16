@@ -9,7 +9,7 @@ use crate::{Hash, HashedKey};
 
 /// Algorithm used as the hasher for the Hamt.
 pub trait HashAlgorithm {
-    fn hash<X>(&mut self, key: &X) -> HashedKey
+    fn rt_hash<X>(&mut self, key: &X) -> HashedKey
     where
         X: Hash + ?Sized;
 }
@@ -33,7 +33,7 @@ impl Hasher for Sha2HasherWrapper {
 pub struct DefaultSha256;
 
 impl HashAlgorithm for DefaultSha256 {
-    fn hash<X>(&mut self, key: &X) -> HashedKey
+    fn rt_hash<X>(&mut self, key: &X) -> HashedKey
     where
         X: Hash + ?Sized,
     {
