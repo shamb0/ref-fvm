@@ -23,7 +23,7 @@ use crate::syscall_error;
 /// in sync contexts.
 pub struct StateTree<S> {
     hamt: Hamt<S, ActorState>,
-    hash_algo: RefCell<DefaultSha256>,
+    hash_algo: DefaultSha256,
 
     version: StateTreeVersion,
     info: Option<Cid>,
@@ -220,7 +220,7 @@ where
         let hamt = Hamt::new_with_bit_width(store, HAMT_BIT_WIDTH);
         Ok(Self {
             hamt,
-            hash_algo: RefCell::new(DefaultSha256::default()),
+            hash_algo: DefaultSha256::default(),
             version,
             info,
             snaps: StateSnapshots::new(),
@@ -265,7 +265,7 @@ where
 
                 Ok(Self {
                     hamt,
-                    hash_algo: RefCell::new(DefaultSha256::default()),
+                    hash_algo: DefaultSha256::default(),
                     version,
                     info,
                     snaps: StateSnapshots::new(),
@@ -297,10 +297,9 @@ where
             StateCacheResult::Uncached => {
                 // if state doesn't exist, find using hamt
                 let key = Address::new_id(id).to_bytes();
-                let mut hash_algo = DefaultSha256::default();
                 let act = self
                     .hamt
-                    .get(&key, &mut hash_algo)
+                    .get(&key, &self.hash_algo)
                     .with_context(|| format!("failed to lookup actor {}", id))
                     .or_fatal()?
                     .cloned();
@@ -467,7 +466,7 @@ where
             match sto {
                 None => {
                     self.hamt
-                        .delete(&addr.to_bytes(), self.hash_algo.get_mut())
+                        .delete(&addr.to_bytes(), &self.hash_algo)
                         .or_fatal()?;
                 }
                 Some(ref state) => {
@@ -475,7 +474,7 @@ where
                         .set(
                             addr.to_bytes().into(),
                             state.clone(),
-                            self.hash_algo.get_mut(),
+                            &self.hash_algo,
                         )
                         .or_fatal()?;
                 }

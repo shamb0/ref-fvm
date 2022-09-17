@@ -133,7 +133,7 @@ where
         &mut self,
         key: K,
         value: V,
-        hash_algo: &mut dyn HashAlgorithm,
+        hash_algo: & dyn HashAlgorithm,
     ) -> Result<Option<V>, Error>
     where
         V: PartialEq,
@@ -180,7 +180,7 @@ where
         &mut self,
         key: K,
         value: V,
-        hash_algo: &mut dyn HashAlgorithm,
+        hash_algo: & dyn HashAlgorithm,
     ) -> Result<bool, Error>
     where
         V: PartialEq,
@@ -217,7 +217,7 @@ where
     /// assert_eq!(map.get(&2).unwrap(), None);
     /// ```
     #[inline]
-    pub fn get<Q>(&self, k: &Q, hash_algo: &mut dyn HashAlgorithm) -> Result<Option<&V>, Error>
+    pub fn get<Q>(&self, k: &Q, hash_algo: & dyn HashAlgorithm) -> Result<Option<&V>, Error>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
@@ -252,7 +252,7 @@ where
     /// assert_eq!(map.contains_key(&2).unwrap(), false);
     /// ```
     #[inline]
-    pub fn contains_key<Q>(&self, k: &Q, hash_algo: &mut dyn HashAlgorithm) -> Result<bool, Error>
+    pub fn contains_key<Q>(&self, k: &Q, hash_algo: & dyn HashAlgorithm) -> Result<bool, Error>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
@@ -286,7 +286,7 @@ where
     pub fn delete<Q>(
         &mut self,
         k: &Q,
-        hash_algo: &mut dyn HashAlgorithm,
+        hash_algo: & dyn HashAlgorithm,
     ) -> Result<Option<(K, V)>, Error>
     where
         K: Borrow<Q>,

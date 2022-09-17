@@ -26,7 +26,7 @@ impl Hasher for Sha2HasherWrapper {
 pub struct DefaultSha256;
 
 impl HashAlgorithm for DefaultSha256 {
-    fn rt_hash(&mut self, key: &dyn Hash) -> HashedKey {
+    fn rt_hash(&self, key: &dyn Hash) -> HashedKey {
         let mut hasher = Sha2HasherWrapper::default();
         key.hash(&mut hasher);
         hasher.0.finalize().into()

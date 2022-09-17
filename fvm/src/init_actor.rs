@@ -96,8 +96,8 @@ impl State {
 
         let mut map = Hamt::<B, _>::load_with_bit_width(&self.address_map, store, HAMT_BIT_WIDTH)
             .or_fatal()?;
-        let mut hash_algo = DefaultSha256::default();
-        map.set(addr.to_bytes().into(), id, &mut hash_algo)
+        let hash_algo = DefaultSha256::default();
+        map.set(addr.to_bytes().into(), id, &hash_algo)
             .or_fatal()?;
         self.address_map = map.flush().or_fatal()?;
 
@@ -126,10 +126,10 @@ impl State {
 
         let map = Hamt::<B, _>::load_with_bit_width(&self.address_map, store, HAMT_BIT_WIDTH)
             .or_fatal()?;
-        let mut hash_algo = DefaultSha256::default();
+        let hash_algo = DefaultSha256::default();
 
         Ok(map
-            .get(&addr.to_bytes(), &mut hash_algo)
+            .get(&addr.to_bytes(), &hash_algo)
             .or_fatal()?
             .copied())
     }
