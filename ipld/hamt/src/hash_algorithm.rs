@@ -3,16 +3,8 @@
 
 use std::hash::Hasher;
 
+use fvm_shared::runtime::traits::{Hash, HashAlgorithm, HashedKey};
 use sha2::{Digest, Sha256 as Sha256Hasher};
-
-use crate::{Hash, HashedKey};
-
-/// Algorithm used as the hasher for the Hamt.
-pub trait HashAlgorithm {
-    fn hash<X: ?Sized>(key: &X) -> HashedKey
-    where
-        X: Hash;
-}
 
 /// Type is needed because the Sha256 hasher does not implement `std::hash::Hasher`
 #[derive(Default)]
@@ -30,14 +22,11 @@ impl Hasher for Sha2HasherWrapper {
 }
 
 /// Sha256 hashing algorithm used for hashing keys in the Hamt.
-#[derive(Debug)]
-pub enum Sha256 {}
+#[derive(Debug, Default)]
+pub struct DefaultSha256;
 
-impl HashAlgorithm for Sha256 {
-    fn hash<X: ?Sized>(key: &X) -> HashedKey
-    where
-        X: Hash,
-    {
+impl HashAlgorithm for DefaultSha256 {
+    fn rt_hash(&mut self, key: &dyn Hash) -> HashedKey {
         let mut hasher = Sha2HasherWrapper::default();
         key.hash(&mut hasher);
         hasher.0.finalize().into()

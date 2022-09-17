@@ -8,7 +8,7 @@ use fvm_ipld_blockstore::MemoryBlockstore;
 use fvm_ipld_encoding::CborStore;
 #[cfg(feature = "identity")]
 use fvm_ipld_hamt::Identity;
-use fvm_ipld_hamt::{BytesKey, Hamt};
+use fvm_ipld_hamt::{BytesKey, DefaultSha256, Hamt};
 use multihash::Code;
 use serde_bytes::ByteBuf;
 
@@ -19,11 +19,18 @@ const BUCKET_SIZE: usize = 3;
 fn test_basics() {
     let store = MemoryBlockstore::default();
     let mut hamt = Hamt::<_, String, _>::new(&store);
-    hamt.set(1, "world".to_string()).unwrap();
+    let mut hash_algo = DefaultSha256::default();
+    hamt.set(1, "world".to_string(), &mut hash_algo).unwrap();
 
-    assert_eq!(hamt.get(&1).unwrap(), Some(&"world".to_string()));
-    hamt.set(1, "world2".to_string()).unwrap();
-    assert_eq!(hamt.get(&1).unwrap(), Some(&"world2".to_string()));
+    assert_eq!(
+        hamt.get(&1, &mut hash_algo).unwrap(),
+        Some(&"world".to_string())
+    );
+    hamt.set(1, "world2".to_string(), &mut hash_algo).unwrap();
+    assert_eq!(
+        hamt.get(&1, &mut hash_algo).unwrap(),
+        Some(&"world2".to_string())
+    );
 }
 
 #[test]
@@ -31,18 +38,26 @@ fn test_load() {
     let store = MemoryBlockstore::default();
 
     let mut hamt: Hamt<_, _, usize> = Hamt::new(&store);
-    hamt.set(1, "world".to_string()).unwrap();
+    let mut hash_algo = DefaultSha256::default();
 
-    assert_eq!(hamt.get(&1).unwrap(), Some(&"world".to_string()));
-    hamt.set(1, "world2".to_string()).unwrap();
-    assert_eq!(hamt.get(&1).unwrap(), Some(&"world2".to_string()));
+    hamt.set(1, "world".to_string(), &mut hash_algo).unwrap();
+
+    assert_eq!(
+        hamt.get(&1, &mut hash_algo).unwrap(),
+        Some(&"world".to_string())
+    );
+    hamt.set(1, "world2".to_string(), &mut hash_algo).unwrap();
+    assert_eq!(
+        hamt.get(&1, &mut hash_algo).unwrap(),
+        Some(&"world2".to_string())
+    );
     let c = hamt.flush().unwrap();
 
     let new_hamt = Hamt::load(&c, &store).unwrap();
     assert_eq!(hamt, new_hamt);
 
     // set value in the first one
-    hamt.set(2, "stuff".to_string()).unwrap();
+    hamt.set(2, "stuff".to_string(), &mut hash_algo).unwrap();
 
     // loading original hash should returnnot be equal now
     let new_hamt = Hamt::load(&c, &store).unwrap();
@@ -67,17 +82,30 @@ fn test_set_if_absent() {
     let mem = MemoryBlockstore::default();
     let store = TrackingBlockstore::new(&mem);
 
+    let mut hash_algo = DefaultSha256::default();
     let mut hamt: Hamt<_, _> = Hamt::new(&store);
     assert!(hamt
-        .set_if_absent(tstring("favorite-animal"), tstring("owl bear"))
+        .set_if_absent(
+            tstring("favorite-animal"),
+            tstring("owl bear"),
+            &mut hash_algo
+        )
         .unwrap());
 
     // Next two are negatively asserted, shouldn't change
     assert!(!hamt
-        .set_if_absent(tstring("favorite-animal"), tstring("bright green bear"))
+        .set_if_absent(
+            tstring("favorite-animal"),
+            tstring("bright green bear"),
+            &mut hash_algo
+        )
         .unwrap());
     assert!(!hamt
-        .set_if_absent(tstring("favorite-animal"), tstring("owl bear"))
+        .set_if_absent(
+            tstring("favorite-animal"),
+            tstring("owl bear"),
+            &mut hash_algo
+        )
         .unwrap());
 
     let c = hamt.flush().unwrap();
@@ -85,7 +113,11 @@ fn test_set_if_absent() {
     let mut h2 = Hamt::<_, BytesKey>::load(&c, &store).unwrap();
     // Reloading should still have same effect
     assert!(!h2
-        .set_if_absent(tstring("favorite-animal"), tstring("bright green bear"))
+        .set_if_absent(
+            tstring("favorite-animal"),
+            tstring("bright green bear"),
+            &mut hash_algo
+        )
         .unwrap());
 
     assert_eq!(
@@ -101,10 +133,12 @@ fn set_with_no_effect_does_not_put() {
     let mem = MemoryBlockstore::default();
     let store = TrackingBlockstore::new(&mem);
 
+    let mut hash_algo = DefaultSha256::default();
     let mut begn: Hamt<_, _> = Hamt::new_with_bit_width(&store, 1);
     let entries = 2 * BUCKET_SIZE * 5;
     for i in 0..entries {
-        begn.set(tstring(i), tstring("filler")).unwrap();
+        begn.set(tstring(i), tstring("filler"), &mut hash_algo)
+            .unwrap();
     }
 
     let c = begn.flush().unwrap();
@@ -113,8 +147,12 @@ fn set_with_no_effect_does_not_put() {
         "bafy2bzacebjilcrsqa4uyxuh36gllup4rlgnvwgeywdm5yqq2ks4jrsj756qq"
     );
 
-    begn.set(tstring("favorite-animal"), tstring("bright green bear"))
-        .unwrap();
+    begn.set(
+        tstring("favorite-animal"),
+        tstring("bright green bear"),
+        &mut hash_algo,
+    )
+    .unwrap();
     let c2 = begn.flush().unwrap();
     assert_eq!(
         c2.to_string().as_str(),
@@ -124,8 +162,12 @@ fn set_with_no_effect_does_not_put() {
     assert_eq!(*store.stats.borrow(), BSStats {r: 0, w: 18, br: 0, bw: 1282});
 
     // This insert should not change value or affect reads or writes
-    begn.set(tstring("favorite-animal"), tstring("bright green bear"))
-        .unwrap();
+    begn.set(
+        tstring("favorite-animal"),
+        tstring("bright green bear"),
+        &mut hash_algo,
+    )
+    .unwrap();
     let c3 = begn.flush().unwrap();
     assert_eq!(
         c3.to_string().as_str(),
@@ -141,10 +183,14 @@ fn delete() {
     let mem = MemoryBlockstore::default();
     let store = TrackingBlockstore::new(&mem);
 
+    let mut hash_algo = DefaultSha256::default();
     let mut hamt: Hamt<_, _> = Hamt::new(&store);
-    hamt.set(tstring("foo"), tstring("cat dog bear")).unwrap();
-    hamt.set(tstring("bar"), tstring("cat dog")).unwrap();
-    hamt.set(tstring("baz"), tstring("cat")).unwrap();
+    hamt.set(tstring("foo"), tstring("cat dog bear"), &mut hash_algo)
+        .unwrap();
+    hamt.set(tstring("bar"), tstring("cat dog"), &mut hash_algo)
+        .unwrap();
+    hamt.set(tstring("baz"), tstring("cat"), &mut hash_algo)
+        .unwrap();
 
     let c = hamt.flush().unwrap();
     assert_eq!(
@@ -153,8 +199,11 @@ fn delete() {
     );
 
     let mut h2 = Hamt::<_, BytesKey>::load(&c, &store).unwrap();
-    assert!(h2.delete(&b"foo".to_vec()).unwrap().is_some());
-    assert_eq!(h2.get(&b"foo".to_vec()).unwrap(), None);
+    assert!(h2
+        .delete(&b"foo".to_vec(), &mut hash_algo)
+        .unwrap()
+        .is_some());
+    assert_eq!(h2.get(&b"foo".to_vec(), &mut hash_algo).unwrap(), None);
 
     let c2 = h2.flush().unwrap();
     assert_eq!(
@@ -170,10 +219,15 @@ fn delete_case() {
     let mem = MemoryBlockstore::default();
     let store = TrackingBlockstore::new(&mem);
 
+    let mut hash_algo = DefaultSha256::default();
     let mut hamt: Hamt<_, _> = Hamt::new(&store);
 
-    hamt.set([0].to_vec().into(), ByteBuf::from(b"Test data".as_ref()))
-        .unwrap();
+    hamt.set(
+        [0].to_vec().into(),
+        ByteBuf::from(b"Test data".as_ref()),
+        &mut hash_algo,
+    )
+    .unwrap();
 
     let c = hamt.flush().unwrap();
     assert_eq!(
@@ -182,8 +236,8 @@ fn delete_case() {
     );
 
     let mut h2 = Hamt::<_, ByteBuf>::load(&c, &store).unwrap();
-    assert!(h2.delete(&[0].to_vec()).unwrap().is_some());
-    assert_eq!(h2.get(&[0].to_vec()).unwrap(), None);
+    assert!(h2.delete(&[0].to_vec(), &mut hash_algo).unwrap().is_some());
+    assert_eq!(h2.get(&[0].to_vec(), &mut hash_algo).unwrap(), None);
 
     let c2 = h2.flush().unwrap();
     assert_eq!(
@@ -220,9 +274,10 @@ fn set_delete_many() {
 
     // Test vectors setup specifically for bit width of 5
     let mut hamt: Hamt<_, BytesKey> = Hamt::new_with_bit_width(&store, 5);
+    let mut hash_algo = DefaultSha256::default();
 
     for i in 0..200 {
-        hamt.set(tstring(i), tstring(i)).unwrap();
+        hamt.set(tstring(i), tstring(i), &mut hash_algo).unwrap();
     }
 
     let c1 = hamt.flush().unwrap();
@@ -232,7 +287,7 @@ fn set_delete_many() {
     );
 
     for i in 200..400 {
-        hamt.set(tstring(i), tstring(i)).unwrap();
+        hamt.set(tstring(i), tstring(i), &mut hash_algo).unwrap();
     }
 
     let cid_all = hamt.flush().unwrap();
@@ -242,11 +297,14 @@ fn set_delete_many() {
     );
 
     for i in 200..400 {
-        assert!(hamt.delete(&tstring(i)).unwrap().is_some());
+        assert!(hamt.delete(&tstring(i), &mut hash_algo).unwrap().is_some());
     }
     // Ensure first 200 keys still exist
     for i in 0..200 {
-        assert_eq!(hamt.get(&tstring(i)).unwrap(), Some(&tstring(i)));
+        assert_eq!(
+            hamt.get(&tstring(i), &mut hash_algo).unwrap(),
+            Some(&tstring(i))
+        );
     }
 
     let cid_d = hamt.flush().unwrap();
@@ -263,9 +321,10 @@ fn for_each() {
     let store = TrackingBlockstore::new(&mem);
 
     let mut hamt: Hamt<_, BytesKey> = Hamt::new_with_bit_width(&store, 5);
+    let mut hash_algo = DefaultSha256::default();
 
     for i in 0..200 {
-        hamt.set(tstring(i), tstring(i)).unwrap();
+        hamt.set(tstring(i), tstring(i), &mut hash_algo).unwrap();
     }
 
     // Iterating through hamt with dirty caches.
@@ -452,9 +511,10 @@ fn clean_child_ordering() {
     let store = TrackingBlockstore::new(&mem);
 
     let mut h: Hamt<_, _> = Hamt::new_with_bit_width(&store, 5);
+    let mut hash_algo = DefaultSha256::default();
 
     for i in 100..195 {
-        h.set(make_key(i), dummy_value).unwrap();
+        h.set(make_key(i), dummy_value, &mut hash_algo).unwrap();
     }
 
     let root = h.flush().unwrap();
@@ -463,9 +523,10 @@ fn clean_child_ordering() {
         "bafy2bzacebqox3gtng4ytexyacr6zmaliyins3llnhbnfbcrqmhzuhmuuawqk"
     );
     let mut h = Hamt::<_, u8>::load_with_bit_width(&root, &store, 5).unwrap();
+    let mut hash_algo = DefaultSha256::default();
 
-    h.delete(&make_key(104)).unwrap();
-    h.delete(&make_key(108)).unwrap();
+    h.delete(&make_key(104), &mut hash_algo).unwrap();
+    h.delete(&make_key(108), &mut hash_algo).unwrap();
     let root = h.flush().unwrap();
     Hamt::<_, u8>::load_with_bit_width(&root, &store, 5).unwrap();
 

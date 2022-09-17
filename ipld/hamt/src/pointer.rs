@@ -5,26 +5,27 @@ use std::cmp::Ordering;
 use std::convert::{TryFrom, TryInto};
 
 use cid::Cid;
+use fvm_shared::runtime::traits::Hash;
 use libipld_core::ipld::Ipld;
 use once_cell::unsync::OnceCell;
 use serde::de::{self, DeserializeOwned};
 use serde::{ser, Deserialize, Deserializer, Serialize, Serializer};
 
 use super::node::Node;
-use super::{Error, Hash, HashAlgorithm, KeyValuePair, MAX_ARRAY_WIDTH};
+use super::{Error, KeyValuePair, MAX_ARRAY_WIDTH};
 
 /// Pointer to index values or a link to another child node.
 #[derive(Debug)]
-pub(crate) enum Pointer<K, V, H> {
+pub(crate) enum Pointer<K, V> {
     Values(Vec<KeyValuePair<K, V>>),
     Link {
         cid: Cid,
-        cache: OnceCell<Box<Node<K, V, H>>>,
+        cache: OnceCell<Box<Node<K, V>>>,
     },
-    Dirty(Box<Node<K, V, H>>),
+    Dirty(Box<Node<K, V>>),
 }
 
-impl<K: PartialEq, V: PartialEq, H> PartialEq for Pointer<K, V, H> {
+impl<K: PartialEq, V: PartialEq> PartialEq for Pointer<K, V> {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (&Pointer::Values(ref a), &Pointer::Values(ref b)) => a == b,
@@ -36,7 +37,7 @@ impl<K: PartialEq, V: PartialEq, H> PartialEq for Pointer<K, V, H> {
 }
 
 /// Serialize the Pointer like an untagged enum.
-impl<K, V, H> Serialize for Pointer<K, V, H>
+impl<K, V> Serialize for Pointer<K, V>
 where
     K: Serialize,
     V: Serialize,
@@ -53,7 +54,7 @@ where
     }
 }
 
-impl<K, V, H> TryFrom<Ipld> for Pointer<K, V, H>
+impl<K, V> TryFrom<Ipld> for Pointer<K, V>
 where
     K: DeserializeOwned,
     V: DeserializeOwned,
@@ -80,7 +81,7 @@ where
 }
 
 /// Deserialize the Pointer like an untagged enum.
-impl<'de, K, V, H> Deserialize<'de> for Pointer<K, V, H>
+impl<'de, K, V> Deserialize<'de> for Pointer<K, V>
 where
     K: DeserializeOwned,
     V: DeserializeOwned,
@@ -93,17 +94,16 @@ where
     }
 }
 
-impl<K, V, H> Default for Pointer<K, V, H> {
+impl<K, V> Default for Pointer<K, V> {
     fn default() -> Self {
         Pointer::Values(Vec::new())
     }
 }
 
-impl<K, V, H> Pointer<K, V, H>
+impl<K, V> Pointer<K, V>
 where
     K: Serialize + DeserializeOwned + Hash + PartialOrd,
     V: Serialize + DeserializeOwned,
-    H: HashAlgorithm,
 {
     pub(crate) fn from_key_value(key: K, value: V) -> Self {
         Pointer::Values(vec![KeyValuePair::new(key, value)])

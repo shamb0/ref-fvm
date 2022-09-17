@@ -2,18 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0, MIT
 
 use std::borrow::Borrow;
-use std::marker::PhantomData;
 
 use cid::Cid;
-use forest_hash_utils::BytesKey;
 use fvm_ipld_blockstore::Blockstore;
 use fvm_ipld_encoding::CborStore;
+use fvm_shared::runtime::traits::{BytesKey, Hash, HashAlgorithm};
 use multihash::Code;
 use serde::de::DeserializeOwned;
 use serde::{Serialize, Serializer};
 
 use crate::node::Node;
-use crate::{Error, Hash, HashAlgorithm, Sha256, DEFAULT_BIT_WIDTH};
+use crate::{Error, DEFAULT_BIT_WIDTH};
 
 /// Implementation of the HAMT data structure for IPLD.
 ///
@@ -32,19 +31,16 @@ use crate::{Error, Hash, HashAlgorithm, Sha256, DEFAULT_BIT_WIDTH};
 /// let cid = map.flush().unwrap();
 /// ```
 #[derive(Debug)]
-pub struct Hamt<BS, V, K = BytesKey, H = Sha256> {
-    root: Node<K, V, H>,
+pub struct Hamt<BS, V, K = BytesKey> {
+    root: Node<K, V>,
     store: BS,
-
     bit_width: u32,
-    hash: PhantomData<H>,
 }
 
-impl<BS, V, K, H> Serialize for Hamt<BS, V, K, H>
+impl<BS, V, K> Serialize for Hamt<BS, V, K>
 where
     K: Serialize,
     V: Serialize,
-    H: HashAlgorithm,
 {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -54,18 +50,17 @@ where
     }
 }
 
-impl<K: PartialEq, V: PartialEq, S: Blockstore, H: HashAlgorithm> PartialEq for Hamt<S, V, K, H> {
+impl<K: PartialEq, V: PartialEq, S: Blockstore> PartialEq for Hamt<S, V, K> {
     fn eq(&self, other: &Self) -> bool {
         self.root == other.root
     }
 }
 
-impl<BS, V, K, H> Hamt<BS, V, K, H>
+impl<BS, V, K> Hamt<BS, V, K>
 where
     K: Hash + Eq + PartialOrd + Serialize + DeserializeOwned,
     V: Serialize + DeserializeOwned,
     BS: Blockstore,
-    H: HashAlgorithm,
 {
     pub fn new(store: BS) -> Self {
         Self::new_with_bit_width(store, DEFAULT_BIT_WIDTH)
@@ -77,7 +72,6 @@ where
             root: Node::default(),
             store,
             bit_width,
-            hash: Default::default(),
         }
     }
 
@@ -93,7 +87,6 @@ where
                 root,
                 store,
                 bit_width,
-                hash: Default::default(),
             }),
             None => Err(Error::CidNotFound(cid.to_string())),
         }
@@ -136,12 +129,24 @@ where
     /// map.set(37, "b".to_string()).unwrap();
     /// map.set(37, "c".to_string()).unwrap();
     /// ```
-    pub fn set(&mut self, key: K, value: V) -> Result<Option<V>, Error>
+    pub fn set(
+        &mut self,
+        key: K,
+        value: V,
+        hash_algo: &mut dyn HashAlgorithm,
+    ) -> Result<Option<V>, Error>
     where
         V: PartialEq,
     {
         self.root
-            .set(key, value, self.store.borrow(), self.bit_width, true)
+            .set(
+                key,
+                value,
+                self.store.borrow(),
+                hash_algo,
+                self.bit_width,
+                true,
+            )
             .map(|(r, _)| r)
     }
 
@@ -171,12 +176,24 @@ where
     /// let c = map.set_if_absent(30, "c".to_string()).unwrap();
     /// assert_eq!(c, true);
     /// ```
-    pub fn set_if_absent(&mut self, key: K, value: V) -> Result<bool, Error>
+    pub fn set_if_absent(
+        &mut self,
+        key: K,
+        value: V,
+        hash_algo: &mut dyn HashAlgorithm,
+    ) -> Result<bool, Error>
     where
         V: PartialEq,
     {
         self.root
-            .set(key, value, self.store.borrow(), self.bit_width, false)
+            .set(
+                key,
+                value,
+                self.store.borrow(),
+                hash_algo,
+                self.bit_width,
+                false,
+            )
             .map(|(_, set)| set)
     }
 
@@ -200,13 +217,16 @@ where
     /// assert_eq!(map.get(&2).unwrap(), None);
     /// ```
     #[inline]
-    pub fn get<Q: ?Sized>(&self, k: &Q) -> Result<Option<&V>, Error>
+    pub fn get<Q>(&self, k: &Q, hash_algo: &mut dyn HashAlgorithm) -> Result<Option<&V>, Error>
     where
         K: Borrow<Q>,
-        Q: Hash + Eq,
+        Q: Hash + Eq + ?Sized,
         V: DeserializeOwned,
     {
-        match self.root.get(k, self.store.borrow(), self.bit_width)? {
+        match self
+            .root
+            .get(k, self.store.borrow(), hash_algo, self.bit_width)?
+        {
             Some(v) => Ok(Some(v)),
             None => Ok(None),
         }
@@ -232,14 +252,14 @@ where
     /// assert_eq!(map.contains_key(&2).unwrap(), false);
     /// ```
     #[inline]
-    pub fn contains_key<Q: ?Sized>(&self, k: &Q) -> Result<bool, Error>
+    pub fn contains_key<Q>(&self, k: &Q, hash_algo: &mut dyn HashAlgorithm) -> Result<bool, Error>
     where
         K: Borrow<Q>,
-        Q: Hash + Eq,
+        Q: Hash + Eq + ?Sized,
     {
         Ok(self
             .root
-            .get(k, self.store.borrow(), self.bit_width)?
+            .get(k, self.store.borrow(), hash_algo, self.bit_width)?
             .is_some())
     }
 
@@ -263,13 +283,17 @@ where
     /// assert_eq!(map.delete(&1).unwrap(), Some((1, "a".to_string())));
     /// assert_eq!(map.delete(&1).unwrap(), None);
     /// ```
-    pub fn delete<Q: ?Sized>(&mut self, k: &Q) -> Result<Option<(K, V)>, Error>
+    pub fn delete<Q>(
+        &mut self,
+        k: &Q,
+        hash_algo: &mut dyn HashAlgorithm,
+    ) -> Result<Option<(K, V)>, Error>
     where
         K: Borrow<Q>,
-        Q: Hash + Eq,
+        Q: Hash + Eq + ?Sized,
     {
         self.root
-            .remove_entry(k, self.store.borrow(), self.bit_width)
+            .remove_entry(k, self.store.borrow(), hash_algo, self.bit_width)
     }
 
     /// Flush root and return Cid for hamt
