@@ -12,7 +12,7 @@ use serde::de::DeserializeOwned;
 use serde::{Serialize, Serializer};
 
 use crate::node::Node;
-use crate::{Error, DEFAULT_BIT_WIDTH};
+use crate::{Error, DEFAULT_BIT_WIDTH, DefaultSha256};
 
 /// Implementation of the HAMT data structure for IPLD.
 ///
@@ -30,17 +30,29 @@ use crate::{Error, DEFAULT_BIT_WIDTH};
 /// assert_eq!(map.get::<_>(&1).unwrap(), None);
 /// let cid = map.flush().unwrap();
 /// ```
+
+lazy_static::lazy_static! {
+    /// Cid of the empty array Cbor bytes (`EMPTY_ARR_BYTES`).
+    pub static ref GLOBAL_DEFAULT_SHA256_ALGO: DefaultSha256 = {
+        DefaultSha256::default()
+	};
+}
+
 #[derive(Debug)]
-pub struct Hamt<BS, V, K = BytesKey> {
+pub struct Hamt<'a, BS, V, HA, K = BytesKey>
+{
     root: Node<K, V>,
     store: BS,
     bit_width: u32,
+	hash_algo: &'a HA,
 }
 
-impl<BS, V, K> Serialize for Hamt<BS, V, K>
+impl<'a, BS, V, HA, K> Serialize for Hamt<'a, BS, V, HA, K>
 where
-    K: Serialize,
-    V: Serialize,
+	BS: Blockstore,
+	V: Serialize,
+	HA: HashAlgorithm,
+	K: Serialize,
 {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -50,43 +62,57 @@ where
     }
 }
 
-impl<K: PartialEq, V: PartialEq, S: Blockstore> PartialEq for Hamt<S, V, K> {
+impl<'a, BS, V, HA, K> PartialEq for Hamt<'a, BS, V, HA, K>
+where
+	BS: Blockstore,
+	V: PartialEq,
+	HA: HashAlgorithm,
+	K: PartialEq,
+{
     fn eq(&self, other: &Self) -> bool {
         self.root == other.root
     }
 }
 
-impl<BS, V, K> Hamt<BS, V, K>
+impl<'a, BS, V, HA, K> Hamt<'a, BS, V, HA, K>
 where
-    K: Hash + Eq + PartialOrd + Serialize + DeserializeOwned,
-    V: Serialize + DeserializeOwned,
-    BS: Blockstore,
+	BS: Blockstore,
+	V: Serialize + DeserializeOwned,
+	HA: HashAlgorithm,
+	K: Hash + Eq + PartialOrd + Serialize + DeserializeOwned,
 {
+
+	pub fn get_default_hash_algo() -> &'static HA {
+		&GLOBAL_DEFAULT_SHA256_ALGO
+	}
+
     pub fn new(store: BS) -> Self {
-        Self::new_with_bit_width(store, DEFAULT_BIT_WIDTH)
+        Self::new_with_bit_width(store, DEFAULT_BIT_WIDTH, Self::get_default_hash_algo())
     }
 
     /// Construct hamt with a bit width
-    pub fn new_with_bit_width(store: BS, bit_width: u32) -> Self {
+    pub fn new_with_bit_width(store: BS, bit_width: u32, hash_algo: &'a HA) -> Self {
         Self {
             root: Node::default(),
             store,
             bit_width,
+			hash_algo,
         }
     }
 
     /// Lazily instantiate a hamt from this root Cid.
-    pub fn load(cid: &Cid, store: BS) -> Result<Self, Error> {
-        Self::load_with_bit_width(cid, store, DEFAULT_BIT_WIDTH)
+    pub fn load(cid: &Cid, store: BS, hash_algo: &'a HA) -> Result<Self, Error> {
+        Self::load_with_bit_width(cid, store, DEFAULT_BIT_WIDTH, hash_algo)
     }
 
     /// Lazily instantiate a hamt from this root Cid with a specified bit width.
-    pub fn load_with_bit_width(cid: &Cid, store: BS, bit_width: u32) -> Result<Self, Error> {
+    pub fn load_with_bit_width(cid: &Cid, store: BS, bit_width: u32, hash_algo: &'a HA) -> Result<Self, Error> {
         match store.get_cbor(cid)? {
             Some(root) => Ok(Self {
                 root,
                 store,
                 bit_width,
+				hash_algo
             }),
             None => Err(Error::CidNotFound(cid.to_string())),
         }
@@ -133,7 +159,6 @@ where
         &mut self,
         key: K,
         value: V,
-        hash_algo: & dyn HashAlgorithm,
     ) -> Result<Option<V>, Error>
     where
         V: PartialEq,
@@ -143,7 +168,7 @@ where
                 key,
                 value,
                 self.store.borrow(),
-                hash_algo,
+                self.hash_algo,
                 self.bit_width,
                 true,
             )
@@ -180,7 +205,6 @@ where
         &mut self,
         key: K,
         value: V,
-        hash_algo: & dyn HashAlgorithm,
     ) -> Result<bool, Error>
     where
         V: PartialEq,
@@ -190,7 +214,7 @@ where
                 key,
                 value,
                 self.store.borrow(),
-                hash_algo,
+                self.hash_algo,
                 self.bit_width,
                 false,
             )
@@ -217,7 +241,7 @@ where
     /// assert_eq!(map.get(&2).unwrap(), None);
     /// ```
     #[inline]
-    pub fn get<Q>(&self, k: &Q, hash_algo: & dyn HashAlgorithm) -> Result<Option<&V>, Error>
+    pub fn get<Q>(&self, k: &Q) -> Result<Option<&V>, Error>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
@@ -225,7 +249,7 @@ where
     {
         match self
             .root
-            .get(k, self.store.borrow(), hash_algo, self.bit_width)?
+            .get(k, self.store.borrow(), self.hash_algo, self.bit_width)?
         {
             Some(v) => Ok(Some(v)),
             None => Ok(None),
@@ -252,14 +276,14 @@ where
     /// assert_eq!(map.contains_key(&2).unwrap(), false);
     /// ```
     #[inline]
-    pub fn contains_key<Q>(&self, k: &Q, hash_algo: & dyn HashAlgorithm) -> Result<bool, Error>
+    pub fn contains_key<Q>(&self, k: &Q) -> Result<bool, Error>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
         Ok(self
             .root
-            .get(k, self.store.borrow(), hash_algo, self.bit_width)?
+            .get(k, self.store.borrow(), self.hash_algo, self.bit_width)?
             .is_some())
     }
 
@@ -286,14 +310,13 @@ where
     pub fn delete<Q>(
         &mut self,
         k: &Q,
-        hash_algo: & dyn HashAlgorithm,
     ) -> Result<Option<(K, V)>, Error>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
         self.root
-            .remove_entry(k, self.store.borrow(), hash_algo, self.bit_width)
+            .remove_entry(k, self.store.borrow(), self.hash_algo, self.bit_width)
     }
 
     /// Flush root and return Cid for hamt
