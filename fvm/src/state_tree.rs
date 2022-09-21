@@ -9,7 +9,7 @@ use cid::{multihash, Cid};
 use fvm_ipld_blockstore::Blockstore;
 use fvm_ipld_encoding::tuple::*;
 use fvm_ipld_encoding::CborStore;
-use fvm_ipld_hamt::{DefaultSha256, Hamt};
+use fvm_ipld_hamt::{GLOBAL_DEFAULT_SHA256_ALGO, Hamt};
 use fvm_shared::address::{Address, Payload};
 use fvm_shared::econ::TokenAmount;
 use fvm_shared::state::{StateInfo0, StateRoot, StateTreeVersion};
@@ -23,9 +23,8 @@ use crate::syscall_error;
 /// in sync contexts.
 pub struct StateTree<S> {
     hamt: Hamt<S, ActorState>,
-    hash_algo: DefaultSha256,
 
-    version: StateTreeVersion,
+	version: StateTreeVersion,
     info: Option<Cid>,
 
     /// State cache
@@ -216,11 +215,11 @@ where
             }
         };
 
+		let hash_algo = Box::new(GLOBAL_DEFAULT_SHA256_ALGO.as_ref());
         // Both V3 and V4 use bitwidt=5.
-        let hamt = Hamt::new_with_bit_width(store, HAMT_BIT_WIDTH);
+        let hamt = Hamt::new_with_bit_width(store, HAMT_BIT_WIDTH, hash_algo);
         Ok(Self {
             hamt,
-            hash_algo: DefaultSha256::default(),
             version,
             info,
             snaps: StateSnapshots::new(),
@@ -259,13 +258,15 @@ where
                 )))
             }
             StateTreeVersion::V3 | StateTreeVersion::V4 => {
-                let hamt = Hamt::load_with_bit_width(&actors, store, HAMT_BIT_WIDTH)
+
+				let hash_algo = Box::new(GLOBAL_DEFAULT_SHA256_ALGO.as_ref());
+
+                let hamt = Hamt::load_with_bit_width(&actors, store, HAMT_BIT_WIDTH, hash_algo)
                     .context("failed to load state tree")
                     .or_fatal()?;
 
                 Ok(Self {
                     hamt,
-                    hash_algo: DefaultSha256::default(),
                     version,
                     info,
                     snaps: StateSnapshots::new(),
@@ -299,7 +300,7 @@ where
                 let key = Address::new_id(id).to_bytes();
                 let act = self
                     .hamt
-                    .get(&key, &self.hash_algo)
+                    .get(&key)
                     .with_context(|| format!("failed to lookup actor {}", id))
                     .or_fatal()?
                     .cloned();
@@ -466,7 +467,7 @@ where
             match sto {
                 None => {
                     self.hamt
-                        .delete(&addr.to_bytes(), &self.hash_algo)
+                        .delete(&addr.to_bytes())
                         .or_fatal()?;
                 }
                 Some(ref state) => {
@@ -474,7 +475,6 @@ where
                         .set(
                             addr.to_bytes().into(),
                             state.clone(),
-                            &self.hash_algo,
                         )
                         .or_fatal()?;
                 }

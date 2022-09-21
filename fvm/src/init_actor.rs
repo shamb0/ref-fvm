@@ -18,7 +18,7 @@ use cid::Cid;
 use fvm_ipld_blockstore::Blockstore;
 use fvm_ipld_encoding::tuple::*;
 use fvm_ipld_encoding::{Cbor, CborStore};
-use fvm_ipld_hamt::{DefaultSha256, Hamt};
+use fvm_ipld_hamt::{GLOBAL_DEFAULT_SHA256_ALGO, Hamt};
 use fvm_shared::address::{Address, Payload};
 use fvm_shared::{ActorID, HAMT_BIT_WIDTH};
 
@@ -47,8 +47,9 @@ impl State {
         #[cfg(feature = "m2-native")]
         use cid::multihash::Code::Blake2b256;
 
+		let hash_algo = Box::new(GLOBAL_DEFAULT_SHA256_ALGO.as_ref().clone());
         // Empty hamt Cid used for testing
-        let e_cid = Hamt::<_, String>::new_with_bit_width(&store, 5)
+        let e_cid = Hamt::<_, String>::new_with_bit_width(&store, 5, hash_algo)
             .flush()
             .unwrap();
 
@@ -94,10 +95,11 @@ impl State {
         let id = self.next_id;
         self.next_id += 1;
 
-        let mut map = Hamt::<B, _>::load_with_bit_width(&self.address_map, store, HAMT_BIT_WIDTH)
+		let hash_algo = Box::new(GLOBAL_DEFAULT_SHA256_ALGO.as_ref());
+        let mut map = Hamt::<B, _>::load_with_bit_width(&self.address_map, store, HAMT_BIT_WIDTH, hash_algo)
             .or_fatal()?;
-        let hash_algo = DefaultSha256::default();
-        map.set(addr.to_bytes().into(), id, &hash_algo)
+
+        map.set(addr.to_bytes().into(), id)
             .or_fatal()?;
         self.address_map = map.flush().or_fatal()?;
 
@@ -124,12 +126,12 @@ impl State {
             return Ok(Some(id));
         }
 
-        let map = Hamt::<B, _>::load_with_bit_width(&self.address_map, store, HAMT_BIT_WIDTH)
+		let hash_algo = Box::new(GLOBAL_DEFAULT_SHA256_ALGO.as_ref());
+        let map = Hamt::<B, _>::load_with_bit_width(&self.address_map, store, HAMT_BIT_WIDTH, hash_algo)
             .or_fatal()?;
-        let hash_algo = DefaultSha256::default();
 
         Ok(map
-            .get(&addr.to_bytes(), &hash_algo)
+            .get(&addr.to_bytes())
             .or_fatal()?
             .copied())
     }
