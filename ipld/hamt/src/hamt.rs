@@ -4,15 +4,15 @@
 use std::borrow::Borrow;
 
 use cid::Cid;
-use forest_hash_utils::BytesKey;
 use fvm_ipld_blockstore::Blockstore;
 use fvm_ipld_encoding::CborStore;
+use fvm_shared::runtime::traits::{BytesKey, Hash, HashAlgorithm};
 use multihash::Code;
 use serde::de::DeserializeOwned;
 use serde::{Serialize, Serializer};
 
 use crate::node::Node;
-use crate::{Error, Hash, HashAlgorithm, DEFAULT_BIT_WIDTH};
+use crate::{Error, DEFAULT_BIT_WIDTH};
 
 /// Implementation of the HAMT data structure for IPLD.
 ///
@@ -134,10 +134,9 @@ where
     /// map.set(37, "b".to_string()).unwrap();
     /// map.set(37, "c".to_string()).unwrap();
     /// ```
-    pub fn set<H>(&mut self, key: K, value: V, hash_algo: &mut H) -> Result<Option<V>, Error>
+    pub fn set(&mut self, key: K, value: V, hash_algo: & dyn HashAlgorithm) -> Result<Option<V>, Error>
     where
         V: PartialEq,
-        H: HashAlgorithm,
     {
         self.root
             .set(
@@ -177,10 +176,9 @@ where
     /// let c = map.set_if_absent(30, "c".to_string()).unwrap();
     /// assert_eq!(c, true);
     /// ```
-    pub fn set_if_absent<H>(&mut self, key: K, value: V, hash_algo: &mut H) -> Result<bool, Error>
+    pub fn set_if_absent(&mut self, key: K, value: V, hash_algo: & dyn HashAlgorithm) -> Result<bool, Error>
     where
         V: PartialEq,
-        H: HashAlgorithm,
     {
         self.root
             .set(
@@ -214,12 +212,11 @@ where
     /// assert_eq!(map.get(&2).unwrap(), None);
     /// ```
     #[inline]
-    pub fn get<H, Q>(&self, k: &Q, hash_algo: &mut H) -> Result<Option<&V>, Error>
+    pub fn get<Q>(&self, k: &Q, hash_algo: & dyn HashAlgorithm) -> Result<Option<&V>, Error>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
         V: DeserializeOwned,
-        H: HashAlgorithm,
     {
         match self
             .root
@@ -250,11 +247,10 @@ where
     /// assert_eq!(map.contains_key(&2).unwrap(), false);
     /// ```
     #[inline]
-    pub fn contains_key<H, Q>(&self, k: &Q, hash_algo: &mut H) -> Result<bool, Error>
+    pub fn contains_key<Q>(&self, k: &Q, hash_algo: & dyn HashAlgorithm) -> Result<bool, Error>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
-        H: HashAlgorithm,
     {
         Ok(self
             .root
@@ -282,11 +278,10 @@ where
     /// assert_eq!(map.delete(&1).unwrap(), Some((1, "a".to_string())));
     /// assert_eq!(map.delete(&1).unwrap(), None);
     /// ```
-    pub fn delete<H, Q>(&mut self, k: &Q, hash_algo: &mut H) -> Result<Option<(K, V)>, Error>
+    pub fn delete<Q>(&mut self, k: &Q, hash_algo: & dyn HashAlgorithm) -> Result<Option<(K, V)>, Error>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
-        H: HashAlgorithm,
     {
         self.root
             .remove_entry(k, self.store.borrow(), hash_algo, self.bit_width)
