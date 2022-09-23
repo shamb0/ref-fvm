@@ -21,7 +21,7 @@ anyhow = "1.0.51"
 libipld-core = { version = "0.13.1", features = ["serde-codec"] }
 fvm_ipld_encoding = { version = "0.2", path = "../encoding" }
 fvm_ipld_blockstore = { version = "0.1", path = "../blockstore" }
-fvm_shared = { version = "2.0.0-alpha.4", path = "../../shared", features = ["crypto"] }
+fvm_shared = { version = "3.0.0-alpha.2", path = "../../shared", features = ["crypto"] }
 
 [features]
 identity = []

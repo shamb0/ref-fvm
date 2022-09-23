@@ -2,10 +2,7 @@ use cid::Cid;
 use fvm_ipld_encoding::{to_vec, Cbor};
 use fvm_shared::address::Address;
 use fvm_shared::consensus::ConsensusFault;
-<<<<<<< HEAD
 use fvm_shared::crypto::hash::SupportedHashes;
-=======
->>>>>>> b6adc51 (introduce a crypto::recover_secp_public_key syscall. (#707))
 use fvm_shared::crypto::signature::{
     Signature, SECP_PUB_LEN, SECP_SIG_LEN, SECP_SIG_MESSAGE_HASH_SIZE,
 };

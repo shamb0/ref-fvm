@@ -8,7 +8,7 @@ use cid::{multihash, Cid};
 use fvm_ipld_blockstore::Blockstore;
 use fvm_ipld_encoding::tuple::*;
 use fvm_ipld_encoding::CborStore;
-use fvm_ipld_hamt::{GLOBAL_DEFAULT_SHA256_ALGO, Hamt};
+use fvm_ipld_hamt::{Hamt, GLOBAL_DEFAULT_SHA256_ALGO};
 use fvm_shared::address::{Address, Payload};
 use fvm_shared::econ::TokenAmount;
 use fvm_shared::state::{StateInfo0, StateRoot, StateTreeVersion};
@@ -463,10 +463,7 @@ where
             match sto {
                 None => {
                     self.hamt
-                        .delete::<_>(
-                            &addr.to_bytes(),
-                            GLOBAL_DEFAULT_SHA256_ALGO.as_ref(),
-                        )
+                        .delete::<_>(&addr.to_bytes(), GLOBAL_DEFAULT_SHA256_ALGO.as_ref())
                         .or_fatal()?;
                 }
                 Some(ref state) => {

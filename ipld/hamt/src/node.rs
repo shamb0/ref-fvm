@@ -80,7 +80,7 @@ where
         key: K,
         value: V,
         store: &BS,
-        hash_algo: & dyn HashAlgorithm,
+        hash_algo: &dyn HashAlgorithm,
         bit_width: u32,
         overwrite: bool,
     ) -> Result<(Option<V>, bool), Error>
@@ -106,7 +106,7 @@ where
         &self,
         k: &Q,
         store: &BS,
-        hash_algo: & dyn HashAlgorithm,
+        hash_algo: &dyn HashAlgorithm,
         bit_width: u32,
     ) -> Result<Option<&V>, Error>
     where
@@ -124,7 +124,7 @@ where
         &mut self,
         k: &Q,
         store: &BS,
-        hash_algo: & dyn HashAlgorithm,
+        hash_algo: &dyn HashAlgorithm,
         bit_width: u32,
     ) -> Result<Option<(K, V)>, Error>
     where
@@ -182,7 +182,7 @@ where
         &self,
         q: &Q,
         store: &BS,
-        hash_algo: & dyn HashAlgorithm,
+        hash_algo: &dyn HashAlgorithm,
         bit_width: u32,
     ) -> Result<Option<&KeyValuePair<K, V>>, Error>
     where
@@ -251,7 +251,7 @@ where
         key: K,
         value: V,
         store: &BS,
-        hash_algo: & dyn HashAlgorithm,
+        hash_algo: &dyn HashAlgorithm,
         overwrite: bool,
     ) -> Result<(Option<V>, bool), Error>
     where

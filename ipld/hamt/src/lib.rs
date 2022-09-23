@@ -18,7 +18,7 @@ mod hash_bits;
 mod node;
 mod pointer;
 
-pub use fvm_shared::runtime::traits::{BytesKey, Hash, HashAlgorithm};
+pub use fvm_shared::runtime::traits::{BytesKey, Hash, HashAlgorithm, HashedKey};
 use serde::{Deserialize, Serialize};
 
 pub use self::error::Error;

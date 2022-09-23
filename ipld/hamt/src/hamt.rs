@@ -134,7 +134,12 @@ where
     /// map.set(37, "b".to_string()).unwrap();
     /// map.set(37, "c".to_string()).unwrap();
     /// ```
-    pub fn set(&mut self, key: K, value: V, hash_algo: & dyn HashAlgorithm) -> Result<Option<V>, Error>
+    pub fn set(
+        &mut self,
+        key: K,
+        value: V,
+        hash_algo: &dyn HashAlgorithm,
+    ) -> Result<Option<V>, Error>
     where
         V: PartialEq,
     {
@@ -176,7 +181,12 @@ where
     /// let c = map.set_if_absent(30, "c".to_string()).unwrap();
     /// assert_eq!(c, true);
     /// ```
-    pub fn set_if_absent(&mut self, key: K, value: V, hash_algo: & dyn HashAlgorithm) -> Result<bool, Error>
+    pub fn set_if_absent(
+        &mut self,
+        key: K,
+        value: V,
+        hash_algo: &dyn HashAlgorithm,
+    ) -> Result<bool, Error>
     where
         V: PartialEq,
     {
@@ -212,7 +222,7 @@ where
     /// assert_eq!(map.get(&2).unwrap(), None);
     /// ```
     #[inline]
-    pub fn get<Q>(&self, k: &Q, hash_algo: & dyn HashAlgorithm) -> Result<Option<&V>, Error>
+    pub fn get<Q>(&self, k: &Q, hash_algo: &dyn HashAlgorithm) -> Result<Option<&V>, Error>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
@@ -247,7 +257,7 @@ where
     /// assert_eq!(map.contains_key(&2).unwrap(), false);
     /// ```
     #[inline]
-    pub fn contains_key<Q>(&self, k: &Q, hash_algo: & dyn HashAlgorithm) -> Result<bool, Error>
+    pub fn contains_key<Q>(&self, k: &Q, hash_algo: &dyn HashAlgorithm) -> Result<bool, Error>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
@@ -278,7 +288,11 @@ where
     /// assert_eq!(map.delete(&1).unwrap(), Some((1, "a".to_string())));
     /// assert_eq!(map.delete(&1).unwrap(), None);
     /// ```
-    pub fn delete<Q>(&mut self, k: &Q, hash_algo: & dyn HashAlgorithm) -> Result<Option<(K, V)>, Error>
+    pub fn delete<Q>(
+        &mut self,
+        k: &Q,
+        hash_algo: &dyn HashAlgorithm,
+    ) -> Result<Option<(K, V)>, Error>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,

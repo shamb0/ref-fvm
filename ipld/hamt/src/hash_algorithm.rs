@@ -26,7 +26,7 @@ impl Hasher for Sha2HasherWrapper {
 lazy_static::lazy_static! {
     /// Cid of the empty array Cbor bytes (`EMPTY_ARR_BYTES`).
     pub static ref GLOBAL_DEFAULT_SHA256_ALGO: Arc<DefaultSha256> =
-		Arc::new(DefaultSha256::default());
+        Arc::new(DefaultSha256::default());
 }
 
 /// Sha256 hashing algorithm used for hashing keys in the Hamt.

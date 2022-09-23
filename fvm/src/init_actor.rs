@@ -18,7 +18,7 @@ use cid::Cid;
 use fvm_ipld_blockstore::Blockstore;
 use fvm_ipld_encoding::tuple::*;
 use fvm_ipld_encoding::{Cbor, CborStore};
-use fvm_ipld_hamt::{GLOBAL_DEFAULT_SHA256_ALGO, Hamt};
+use fvm_ipld_hamt::{Hamt, GLOBAL_DEFAULT_SHA256_ALGO};
 use fvm_shared::address::{Address, Payload};
 use fvm_shared::{ActorID, HAMT_BIT_WIDTH};
 
@@ -96,8 +96,12 @@ impl State {
 
         let mut map = Hamt::<B, _>::load_with_bit_width(&self.address_map, store, HAMT_BIT_WIDTH)
             .or_fatal()?;
-        map.set(addr.to_bytes().into(), id, GLOBAL_DEFAULT_SHA256_ALGO.as_ref())
-            .or_fatal()?;
+        map.set(
+            addr.to_bytes().into(),
+            id,
+            GLOBAL_DEFAULT_SHA256_ALGO.as_ref(),
+        )
+        .or_fatal()?;
         self.address_map = map.flush().or_fatal()?;
 
         Ok(id)
