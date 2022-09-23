@@ -9,24 +9,23 @@ use cid::Cid;
 use filecoin_proofs_api::{self as proofs, ProverId, PublicReplicaInfo, SectorId};
 use fvm_ipld_blockstore::Blockstore;
 use fvm_ipld_encoding::{bytes_32, from_slice, to_vec};
-use fvm_shared::actor::builtin::Type;
 use fvm_shared::address::Protocol;
-use fvm_shared::bigint::{BigInt, Zero};
+use fvm_shared::bigint::Zero;
 use fvm_shared::consensus::ConsensusFault;
-use fvm_shared::crypto::hash::SupportedHashes;
 use fvm_shared::crypto::signature;
 use fvm_shared::econ::TokenAmount;
 use fvm_shared::error::ErrorNumber;
 use fvm_shared::piece::{zero_piece_commitment, PaddedPieceSize};
 use fvm_shared::sector::SectorInfo;
 use fvm_shared::version::NetworkVersion;
-use fvm_shared::{commcid, ActorID, FILECOIN_PRECISION};
+use fvm_shared::{commcid, ActorID};
 use lazy_static::lazy_static;
 use multihash::MultihashDigest;
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 
 use super::blocks::{Block, BlockRegistry};
 use super::error::Result;
+use super::hash::SupportedHashes;
 use super::*;
 use crate::call_manager::{CallManager, InvocationResult, NO_DATA_BLOCK_ID};
 use crate::externs::{Consensus, Rand};
@@ -36,7 +35,7 @@ use crate::{syscall_error, EMPTY_ARR_CID};
 
 lazy_static! {
     static ref NUM_CPUS: usize = num_cpus::get();
-    static ref INITIAL_RESERVE_BALANCE: BigInt = BigInt::from(300_000_000) * FILECOIN_PRECISION;
+    static ref INITIAL_RESERVE_BALANCE: TokenAmount = TokenAmount::from_whole(300_000_000);
 }
 
 const BLAKE2B_256: u64 = 0xb220;
@@ -117,9 +116,7 @@ where
             .call_manager
             .machine()
             .builtin_actors()
-            .get_by_left(&act.code)
-            .map(Type::is_account_actor)
-            .unwrap_or(false);
+            .is_account_actor(&act.code);
 
         if !is_account {
             // TODO: this is wrong. Maybe some InvalidActor type?
@@ -364,6 +361,10 @@ where
 {
     fn msg_caller(&self) -> ActorID {
         self.caller
+    }
+
+    fn msg_origin(&self) -> (ActorID, &Address) {
+        self.call_manager.origin()
     }
 
     fn msg_receiver(&self) -> ActorID {
@@ -728,8 +729,9 @@ where
 
     // TODO(M2) merge new_actor_address and create_actor into a single syscall.
     fn new_actor_address(&mut self) -> Result<Address> {
+        let origin_addr = *self.call_manager.origin().1;
         let oa = self
-            .resolve_to_key_addr(&self.call_manager.origin(), false)
+            .resolve_to_key_addr(&origin_addr, false)
             // This is already an execution error, but we're _making_ it fatal.
             .or_fatal()?;
 
@@ -750,10 +752,11 @@ where
     fn create_actor(&mut self, code_id: Cid, actor_id: ActorID) -> Result<()> {
         // TODO https://github.com/filecoin-project/builtin-actors/issues/492
         let singleton = self
-            .get_builtin_actor_type(&code_id)
-            .as_ref()
-            .map(Type::is_singleton_actor)
-            .unwrap_or(false);
+            .call_manager
+            .machine()
+            .builtin_actors()
+            .is_singleton_actor(&code_id);
+
         if singleton {
             return Err(
                 syscall_error!(Forbidden; "can only have one instance of singleton actors").into(),
@@ -771,23 +774,22 @@ where
         let state_tree = self.call_manager.state_tree_mut();
         state_tree.set_actor_id(
             actor_id,
-            ActorState::new(code_id, *EMPTY_ARR_CID, 0.into(), 0),
+            ActorState::new(code_id, *EMPTY_ARR_CID, TokenAmount::zero(), 0),
         )
     }
 
-    fn get_builtin_actor_type(&self, code_cid: &Cid) -> Option<actor::builtin::Type> {
+    fn get_builtin_actor_type(&self, code_cid: &Cid) -> u32 {
         self.call_manager
             .machine()
             .builtin_actors()
-            .get_by_left(code_cid)
-            .cloned()
+            .id_by_code(code_cid)
     }
 
-    fn get_code_cid_for_type(&self, typ: actor::builtin::Type) -> Result<Cid> {
+    fn get_code_cid_for_type(&self, typ: u32) -> Result<Cid> {
         self.call_manager
             .machine()
             .builtin_actors()
-            .get_by_right(&typ)
+            .code_by_id(typ)
             .cloned()
             .context("tried to resolve CID of unrecognized actor type")
             .or_illegal_argument()
@@ -842,7 +844,7 @@ where
             let dir: PathBuf = [
                 dir,
                 self.call_manager.machine().machine_id(),
-                &self.call_manager.origin().to_string(),
+                &self.call_manager.origin().0.to_string(),
                 &self.call_manager.nonce().to_string(),
                 &self.actor_id.to_string(),
                 &self.call_manager.invocation_count().to_string(),

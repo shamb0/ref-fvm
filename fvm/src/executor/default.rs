@@ -4,9 +4,7 @@ use std::result::Result as StdResult;
 use anyhow::{anyhow, Result};
 use cid::Cid;
 use fvm_ipld_encoding::{RawBytes, DAG_CBOR};
-use fvm_shared::actor::builtin::Type;
 use fvm_shared::address::Address;
-use fvm_shared::bigint::{BigInt, Sign};
 use fvm_shared::econ::TokenAmount;
 use fvm_shared::error::{ErrorNumber, ExitCode};
 use fvm_shared::message::Message;
@@ -67,7 +65,9 @@ where
 
         // Apply the message.
         let (res, gas_used, mut backtrace, exec_trace) = self.map_machine(|machine| {
-            let mut cm = K::CallManager::new(machine, msg.gas_limit, msg.from, msg.sequence);
+            // We're processing a chain message, so the sender is the origin of the call stack.
+            let mut cm =
+                K::CallManager::new(machine, msg.gas_limit, (sender_id, msg.from), msg.sequence);
             // This error is fatal because it should have already been accounted for inside
             // preflight_message.
             if let Err(e) = cm.charge_gas(inclusion_cost) {
@@ -191,9 +191,9 @@ where
                 msg_receipt: receipt,
                 penalty: TokenAmount::zero(),
                 miner_tip: TokenAmount::zero(),
-                base_fee_burn: TokenAmount::from(0),
-                over_estimation_burn: TokenAmount::from(0),
-                refund: TokenAmount::from(0),
+                base_fee_burn: TokenAmount::zero(),
+                over_estimation_burn: TokenAmount::zero(),
+                refund: TokenAmount::zero(),
                 gas_refund: 0,
                 gas_burned: 0,
                 failure_info,
@@ -300,11 +300,7 @@ where
         };
 
         // If sender is not an account actor, the message is invalid.
-        let sender_is_account = self
-            .builtin_actors()
-            .get_by_left(&sender.code)
-            .map(Type::is_account_actor)
-            .unwrap_or(false);
+        let sender_is_account = self.builtin_actors().is_account_actor(&sender.code);
 
         if !sender_is_account {
             return Ok(Err(ApplyRet::prevalidation_fail(
@@ -354,7 +350,7 @@ where
         msg: Message,
         receipt: Receipt,
         failure_info: Option<ApplyFailure>,
-        gas_cost: BigInt,
+        gas_cost: TokenAmount,
     ) -> anyhow::Result<ApplyRet> {
         // NOTE: we don't support old network versions in the FVM, so we always burn.
         let GasOutputs {
@@ -374,7 +370,7 @@ where
         );
 
         let mut transfer_to_actor = |addr: &Address, amt: &TokenAmount| -> anyhow::Result<()> {
-            if amt.sign() == Sign::Minus {
+            if amt.is_negative() {
                 return Err(anyhow!("attempted to transfer negative value into actor"));
             }
             if amt.is_zero() {

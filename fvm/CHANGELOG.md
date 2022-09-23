@@ -2,9 +2,29 @@
 
 Changes to the reference FVM implementation.
 
-## Unreleased
+##  [Unreleased]
+
+## 3.0.0-alpha.1
+
+- Add the origin to the `vm::context` syscall.
+- Add an `m2-native` feature to enable native actor deployment.
+
+## 2.0.0...
+
+See `release/v2`
 
 - Added `recover_secp_public_key` syscall
+- API BREAKING: Change `TokenAmount` type from a newtype to a struct.
+- Add support for additional hash functions in actors:
+    - sha256
+    - keccak256
+    - ripemd160
+    - blake2b512
+- API BREAKING: add gas charges to the execution trace.
+
+## 2.0.0-alpha.1
+
+Bump major version for breaking changes.
 
 ## 1.1.0 [2022-06-27]
 
@@ -60,17 +80,17 @@ Additionally, this release includes:
 - Requires builtin-actors v7.4.x
 
 ## 0.7.2 [2022-05-09]
- 
+
 - Add `testing` feature to change module visibility; concretely changed
   visibility of `account_actor`, `init_actor` and `system_actor` to `pub`
   to use them in the integration test framework.
 - Propagate gas outputs in ApplyRet.
 - Migrate CBOR serde to [cbor4ii](https://github.com/quininer/cbor4ii).
-- Instrument Wasm bytecode with [filecoin-project/fvm-wasm-instrument](https://github.com/filecoin-project/fvm-wasm-instrument), 
+- Instrument Wasm bytecode with [filecoin-project/fvm-wasm-instrument](https://github.com/filecoin-project/fvm-wasm-instrument),
   a fork of [paritytech/wasm-instrument](https://github.com/paritytech/wasm-instrument)
   for more accurate stack accounting and execution units metering.
 - Abort when aborting fails.
-- Fix syscall binding docs. 
+- Fix syscall binding docs.
 - Fix bugs in Wasm execution units gas accounting.
 - Fix system actor state serialization.
 - Remove unused dependencies from build graph.

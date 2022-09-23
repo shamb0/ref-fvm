@@ -4,14 +4,12 @@ use anyhow::{anyhow, Context as _};
 use cid::Cid;
 use fvm_ipld_blockstore::{Blockstore, Buffered};
 use fvm_ipld_encoding::CborStore;
-use fvm_shared::actor::builtin::{load_manifest, Manifest};
 use fvm_shared::address::Address;
 use fvm_shared::econ::TokenAmount;
 use fvm_shared::error::ErrorNumber;
 use fvm_shared::version::NetworkVersion;
 use fvm_shared::ActorID;
 use log::debug;
-use num_traits::Signed;
 
 use super::{Engine, Machine, MachineContext};
 use crate::blockstore::BufferedBlockstore;
@@ -19,6 +17,7 @@ use crate::externs::Externs;
 #[cfg(feature = "m2-native")]
 use crate::init_actor::State as InitActorState;
 use crate::kernel::{ClassifyResult, Context as _, Result};
+use crate::machine::Manifest;
 use crate::state_tree::{ActorState, StateTree};
 use crate::syscall_error;
 use crate::system_actor::State as SystemActorState;
@@ -65,7 +64,7 @@ where
         externs: E,
     ) -> anyhow::Result<Self> {
         const SUPPORTED_VERSIONS: RangeInclusive<NetworkVersion> =
-            NetworkVersion::V15..=NetworkVersion::V16;
+            NetworkVersion::V15..=NetworkVersion::V17;
 
         debug!(
             "initializing a new machine, epoch={}, base_fee={}, nv={:?}, root={}",
@@ -111,7 +110,7 @@ where
             }
         };
         let builtin_actors =
-            load_manifest(state_tree.store(), &builtin_actors_cid, manifest_version)?;
+            Manifest::load(state_tree.store(), &builtin_actors_cid, manifest_version)?;
 
         // Preload any uncached modules.
         // This interface works for now because we know all actor CIDs
@@ -120,7 +119,7 @@ where
         // Skip preloading all builtin actors when testing. This results in JIT
         // bytecode to machine code compilation, and leads to faster tests.
         #[cfg(not(any(test, feature = "testing")))]
-        engine.preload(state_tree.store(), builtin_actors.left_values())?;
+        engine.preload(state_tree.store(), builtin_actors.builtin_actor_codes())?;
 
         #[cfg(feature = "m2-native")]
         {

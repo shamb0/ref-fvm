@@ -1,6 +1,5 @@
 // Copyright 2019-2022 ChainSafe Systems
 // SPDX-License-Identifier: Apache-2.0, MIT
-
 use std::cell::RefCell;
 use std::collections::HashMap;
 
@@ -9,9 +8,8 @@ use cid::{multihash, Cid};
 use fvm_ipld_blockstore::Blockstore;
 use fvm_ipld_encoding::tuple::*;
 use fvm_ipld_encoding::CborStore;
-use fvm_ipld_hamt::Hamt;
+use fvm_ipld_hamt::{Hamt, GLOBAL_DEFAULT_SHA256_ALGO};
 use fvm_shared::address::{Address, Payload};
-use fvm_shared::bigint::bigint_ser;
 use fvm_shared::econ::TokenAmount;
 use fvm_shared::state::{StateInfo0, StateRoot, StateTreeVersion};
 use fvm_shared::{ActorID, HAMT_BIT_WIDTH};
@@ -295,9 +293,10 @@ where
             StateCacheResult::Uncached => {
                 // if state doesn't exist, find using hamt
                 let key = Address::new_id(id).to_bytes();
+
                 let act = self
                     .hamt
-                    .get(&key)
+                    .get::<_>(&key, GLOBAL_DEFAULT_SHA256_ALGO.as_ref())
                     .with_context(|| format!("failed to lookup actor {}", id))
                     .or_fatal()?
                     .cloned();
@@ -463,11 +462,17 @@ where
             let addr = Address::new_id(id);
             match sto {
                 None => {
-                    self.hamt.delete(&addr.to_bytes()).or_fatal()?;
+                    self.hamt
+                        .delete::<_>(&addr.to_bytes(), GLOBAL_DEFAULT_SHA256_ALGO.as_ref())
+                        .or_fatal()?;
                 }
                 Some(ref state) => {
                     self.hamt
-                        .set(addr.to_bytes().into(), state.clone())
+                        .set(
+                            addr.to_bytes().into(),
+                            state.clone(),
+                            GLOBAL_DEFAULT_SHA256_ALGO.as_ref(),
+                        )
                         .or_fatal()?;
                 }
             }
@@ -522,7 +527,6 @@ pub struct ActorState {
     /// Sequence of the actor.
     pub sequence: u64,
     /// Tokens available to the actor.
-    #[serde(with = "bigint_ser")]
     pub balance: TokenAmount,
 }
 
@@ -640,7 +644,7 @@ mod tests {
     use fvm_ipld_blockstore::MemoryBlockstore;
     use fvm_ipld_encoding::{CborStore, DAG_CBOR};
     use fvm_shared::address::{Address, SECP_PUB_LEN};
-    use fvm_shared::bigint::BigInt;
+    use fvm_shared::econ::TokenAmount;
     use fvm_shared::state::StateTreeVersion;
     use fvm_shared::{IDENTITY_HASH, IPLD_RAW};
     use lazy_static::lazy_static;
@@ -755,7 +759,7 @@ mod tests {
             ActorState::new(
                 *DUMMY_ACCOUNT_ACTOR_CODE_ID,
                 *DUMMY_ACCOUNT_ACTOR_CODE_ID,
-                BigInt::from(55),
+                TokenAmount::from_atto(55),
                 1,
             ),
         )
@@ -766,7 +770,7 @@ mod tests {
             ActorState::new(
                 *DUMMY_ACCOUNT_ACTOR_CODE_ID,
                 *DUMMY_ACCOUNT_ACTOR_CODE_ID,
-                BigInt::from(55),
+                TokenAmount::from_atto(55),
                 1,
             ),
         )
@@ -776,7 +780,7 @@ mod tests {
             ActorState::new(
                 *DUMMY_ACCOUNT_ACTOR_CODE_ID,
                 *DUMMY_ACCOUNT_ACTOR_CODE_ID,
-                BigInt::from(55),
+                TokenAmount::from_atto(55),
                 1,
             ),
         )
@@ -789,7 +793,7 @@ mod tests {
             ActorState::new(
                 *DUMMY_ACCOUNT_ACTOR_CODE_ID,
                 *DUMMY_ACCOUNT_ACTOR_CODE_ID,
-                BigInt::from(55),
+                TokenAmount::from_atto(55),
                 1
             )
         );
@@ -798,7 +802,7 @@ mod tests {
             ActorState::new(
                 *DUMMY_ACCOUNT_ACTOR_CODE_ID,
                 *DUMMY_ACCOUNT_ACTOR_CODE_ID,
-                BigInt::from(55),
+                TokenAmount::from_atto(55),
                 1
             )
         );
@@ -808,7 +812,7 @@ mod tests {
             ActorState::new(
                 *DUMMY_ACCOUNT_ACTOR_CODE_ID,
                 *DUMMY_ACCOUNT_ACTOR_CODE_ID,
-                BigInt::from(55),
+                TokenAmount::from_atto(55),
                 1
             )
         );
@@ -828,7 +832,7 @@ mod tests {
             ActorState::new(
                 *DUMMY_ACCOUNT_ACTOR_CODE_ID,
                 *DUMMY_ACCOUNT_ACTOR_CODE_ID,
-                BigInt::from(55),
+                TokenAmount::from_atto(55),
                 1,
             ),
         )

@@ -16,10 +16,8 @@ use fvm_shared::{ActorID, IPLD_RAW};
 use libsecp256k1::{PublicKey, SecretKey};
 use multihash::Code;
 
-use crate::builtin::{
-    fetch_builtin_code_cid, import_builtin_actors, set_init_actor, set_sys_actor,
-};
-use crate::error::Error::{FailedToFlushTree, NoManifestInformation, NoRootCid};
+use crate::builtin::{fetch_builtin_code_cid, set_init_actor, set_sys_actor};
+use crate::error::Error::{FailedToFlushTree, NoManifestInformation};
 
 const DEFAULT_BASE_FEE: u64 = 100;
 
@@ -50,13 +48,12 @@ where
     B: Blockstore,
     E: Externs,
 {
-    pub fn new(nv: NetworkVersion, stv: StateTreeVersion, blockstore: B) -> Result<Self> {
-        // Load the builtin actors bundles into the blockstore.
-        let nv_actors = import_builtin_actors(&blockstore)?;
-
-        // Get the builtin actors index for the concrete network version.
-        let builtin_actors = *nv_actors.get(&nv).ok_or(NoRootCid(nv))?;
-
+    pub fn new(
+        nv: NetworkVersion,
+        stv: StateTreeVersion,
+        builtin_actors: Cid,
+        blockstore: B,
+    ) -> Result<Self> {
         let (manifest_version, manifest_data_cid): (u32, Cid) =
             match blockstore.get_cbor(&builtin_actors)? {
                 Some((manifest_version, manifest_data)) => (manifest_version, manifest_data),
@@ -96,10 +93,7 @@ where
         let mut ret: [Account; N] = [(0, Address::default()); N];
         for account in ret.iter_mut().take(N) {
             let priv_key = SecretKey::random(rng);
-            *account = self.make_secp256k1_account(
-                priv_key,
-                TokenAmount::from(10u8) * TokenAmount::from(1000),
-            )?;
+            *account = self.make_secp256k1_account(priv_key, TokenAmount::from_atto(10000))?;
         }
         Ok(ret)
     }
@@ -172,7 +166,7 @@ where
         nc.enable_actor_debugging();
 
         let mut mc = nc.for_epoch(0, state_root);
-        mc.set_base_fee(TokenAmount::from(DEFAULT_BASE_FEE));
+        mc.set_base_fee(TokenAmount::from_atto(DEFAULT_BASE_FEE));
 
         let machine = DefaultMachine::new(
             &Engine::new_default((&mc.network.clone()).into())?,

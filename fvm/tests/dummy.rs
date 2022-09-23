@@ -6,15 +6,15 @@ use anyhow::Context;
 use fvm::call_manager::{Backtrace, CallManager, FinishRet, InvocationResult};
 use fvm::externs::{Consensus, Externs, Rand};
 use fvm::gas::{Gas, GasCharge, GasTracker};
-use fvm::machine::{Engine, Machine, MachineContext, NetworkConfig};
+use fvm::machine::{Engine, Machine, MachineContext, Manifest, NetworkConfig};
 use fvm::state_tree::{ActorState, StateTree};
 use fvm::{kernel, Kernel};
 use fvm_ipld_blockstore::{Blockstore, MemoryBlockstore};
 use fvm_ipld_encoding::CborStore;
-use fvm_shared::actor::builtin::Manifest;
 use fvm_shared::address::Address;
 use fvm_shared::state::StateTreeVersion;
 use fvm_shared::version::NetworkVersion;
+use fvm_shared::ActorID;
 use multihash::Code;
 
 pub const STUB_NETWORK_VER: NetworkVersion = NetworkVersion::V15;
@@ -75,8 +75,8 @@ impl DummyMachine {
         let bs = state_tree.into_store();
 
         // Add empty built-in actors manifest to blockstore.
-        let manifest = Manifest::new();
-        let manifest_cid = bs.put_cbor(&manifest, Code::Blake2b256)?;
+        let manifest = Manifest::dummy();
+        let manifest_cid = bs.put_cbor(&Manifest::DUMMY_CODES, Code::Blake2b256)?;
 
         // sanity checks
         bs.has(&root).context("failed to load initial state-root")?;
@@ -166,7 +166,7 @@ impl Machine for DummyMachine {
 pub struct DummyCallManager {
     pub machine: DummyMachine,
     pub gas_tracker: GasTracker,
-    pub origin: Address,
+    pub origin: (ActorID, Address),
     pub nonce: u64,
     pub test_data: Rc<RefCell<TestData>>,
 }
@@ -186,7 +186,7 @@ impl DummyCallManager {
             Self {
                 machine: DummyMachine::new_stub().unwrap(),
                 gas_tracker: GasTracker::new(Gas::new(i64::MAX), Gas::new(0)),
-                origin: Address::new_actor(&[]),
+                origin: (0, Address::new_actor(&[])),
                 nonce: 0,
                 test_data: rc,
             },
@@ -203,7 +203,7 @@ impl DummyCallManager {
             Self {
                 machine: DummyMachine::new_stub().unwrap(),
                 gas_tracker,
-                origin: Address::new_actor(&[]),
+                origin: (0, Address::new_actor(&[])),
                 nonce: 0,
                 test_data: rc,
             },
@@ -215,7 +215,12 @@ impl DummyCallManager {
 impl CallManager for DummyCallManager {
     type Machine = DummyMachine;
 
-    fn new(machine: Self::Machine, _gas_limit: i64, origin: Address, nonce: u64) -> Self {
+    fn new(
+        machine: Self::Machine,
+        _gas_limit: i64,
+        origin: (ActorID, Address),
+        nonce: u64,
+    ) -> Self {
         let rc = Rc::new(RefCell::new(TestData {
             charge_gas_calls: 0,
         }));
@@ -283,8 +288,8 @@ impl CallManager for DummyCallManager {
         self.gas_tracker_mut().apply_charge(charge)
     }
 
-    fn origin(&self) -> Address {
-        self.origin
+    fn origin(&self) -> (ActorID, &Address) {
+        (self.origin.0, &self.origin.1)
     }
 
     fn nonce(&self) -> u64 {

@@ -1,6 +1,3 @@
-mod fil_integer_overflow;
-mod fil_syscall;
-
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -13,17 +10,20 @@ use fil_stack_overflow_actor::WASM_BINARY as OVERFLOW_BINARY;
 use fil_syscall_actor::WASM_BINARY as SYSCALL_BINARY;
 use fvm::executor::{ApplyKind, Executor, ThreadedExecutor};
 use fvm_integration_tests::dummy::DummyExterns;
-use fvm_integration_tests::tester::{Account, IntegrationExecutor, Tester};
+use fvm_integration_tests::tester::{Account, IntegrationExecutor};
 use fvm_ipld_blockstore::{Blockstore, MemoryBlockstore};
 use fvm_ipld_encoding::tuple::*;
 use fvm_shared::address::Address;
-use fvm_shared::bigint::BigInt;
+use fvm_shared::econ::TokenAmount;
 use fvm_shared::error::{ErrorNumber, ExitCode};
 use fvm_shared::message::Message;
 use fvm_shared::state::StateTreeVersion;
 use fvm_shared::version::NetworkVersion;
 use num_traits::Zero;
 use wabt::wat2wasm;
+
+mod bundles;
+use bundles::*;
 
 /// The state object.
 #[derive(Serialize_tuple, Deserialize_tuple, Clone, Debug, Default)]
@@ -34,7 +34,7 @@ pub struct State {
 #[test]
 fn hello_world() {
     // Instantiate tester
-    let mut tester = Tester::new(
+    let mut tester = new_tester(
         NetworkVersion::V15,
         StateTreeVersion::V4,
         MemoryBlockstore::default(),
@@ -53,7 +53,7 @@ fn hello_world() {
     let actor_address = Address::new_id(10000);
 
     tester
-        .set_actor_from_bin(wasm_bin, state_cid, actor_address, BigInt::zero())
+        .set_actor_from_bin(wasm_bin, state_cid, actor_address, TokenAmount::zero())
         .unwrap();
 
     // Instantiate machine
@@ -80,7 +80,7 @@ fn hello_world() {
 #[test]
 fn ipld() {
     // Instantiate tester
-    let mut tester = Tester::new(
+    let mut tester = new_tester(
         NetworkVersion::V15,
         StateTreeVersion::V4,
         MemoryBlockstore::default(),
@@ -99,7 +99,7 @@ fn ipld() {
     let actor_address = Address::new_id(10000);
 
     tester
-        .set_actor_from_bin(wasm_bin, state_cid, actor_address, BigInt::zero())
+        .set_actor_from_bin(wasm_bin, state_cid, actor_address, TokenAmount::zero())
         .unwrap();
 
     // Instantiate machine
@@ -132,7 +132,7 @@ fn ipld() {
 #[test]
 fn syscalls() {
     // Instantiate tester
-    let mut tester = Tester::new(
+    let mut tester = new_tester(
         NetworkVersion::V16,
         StateTreeVersion::V4,
         MemoryBlockstore::default(),
@@ -151,7 +151,7 @@ fn syscalls() {
     let actor_address = Address::new_id(10000);
 
     tester
-        .set_actor_from_bin(wasm_bin, state_cid, actor_address, BigInt::zero())
+        .set_actor_from_bin(wasm_bin, state_cid, actor_address, TokenAmount::zero())
         .unwrap();
 
     // Instantiate machine
@@ -184,7 +184,7 @@ fn syscalls() {
 #[test]
 fn native_stack_overflow() {
     // Instantiate tester
-    let mut tester = Tester::new(
+    let mut tester = new_tester(
         NetworkVersion::V16,
         StateTreeVersion::V4,
         MemoryBlockstore::default(),
@@ -203,7 +203,7 @@ fn native_stack_overflow() {
     let actor_address = Address::new_id(10000);
 
     tester
-        .set_actor_from_bin(wasm_bin, state_cid, actor_address, BigInt::zero())
+        .set_actor_from_bin(wasm_bin, state_cid, actor_address, TokenAmount::zero())
         .unwrap();
 
     // Instantiate machine
@@ -249,7 +249,7 @@ fn native_stack_overflow() {
 
 fn test_exitcode(wat: &str, code: ExitCode) {
     // Instantiate tester
-    let mut tester = Tester::new(
+    let mut tester = new_tester(
         NetworkVersion::V16,
         StateTreeVersion::V4,
         MemoryBlockstore::default(),
@@ -269,7 +269,7 @@ fn test_exitcode(wat: &str, code: ExitCode) {
     let actor_address = Address::new_id(10000);
 
     tester
-        .set_actor_from_bin(&wasm_bin, state_cid, actor_address, BigInt::zero())
+        .set_actor_from_bin(&wasm_bin, state_cid, actor_address, TokenAmount::zero())
         .unwrap();
 
     // Instantiate machine
@@ -405,7 +405,7 @@ fn backtraces() {
     };
 
     // Instantiate tester
-    let mut tester = Tester::new(
+    let mut tester = new_tester(
         NetworkVersion::V16,
         StateTreeVersion::V4,
         blockstore.clone(),
@@ -420,10 +420,10 @@ fn backtraces() {
     let (wasm_abort, wasm_fatal) = (wat2wasm(WAT_ABORT).unwrap(), wat2wasm(WAT_FAIL).unwrap());
     let (abort_address, fatal_address) = (Address::new_id(10000), Address::new_id(10001));
     tester
-        .set_actor_from_bin(&wasm_abort, state_cid, abort_address, BigInt::zero())
+        .set_actor_from_bin(&wasm_abort, state_cid, abort_address, TokenAmount::zero())
         .unwrap();
     tester
-        .set_actor_from_bin(&wasm_fatal, state_cid, fatal_address, BigInt::zero())
+        .set_actor_from_bin(&wasm_fatal, state_cid, fatal_address, TokenAmount::zero())
         .unwrap();
 
     // Instantiate machine

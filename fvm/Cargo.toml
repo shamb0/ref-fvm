@@ -1,7 +1,7 @@
 [package]
 name = "fvm"
 description = "Filecoin Virtual Machine reference implementation"
-version = "2.0.0-alpha.1"
+version = "3.0.0-alpha.1"
 license = "MIT OR Apache-2.0"
 authors = ["Protocol Labs", "Filecoin Core Devs"]
 edition = "2021"
@@ -12,14 +12,14 @@ keywords = ["filecoin", "web3", "wasm"]
 crate-type = ["lib"]
 
 [dependencies]
-anyhow = "1.0.47"
+anyhow = { version = "1.0.47", features = ["backtrace"] }
 thiserror = "1.0.30"
 num-traits = "0.2"
 derive_builder = "0.11.2"
 num-derive = "0.3.3"
 cid = { version = "0.8.5", default-features = false, features = ["serde-codec"] }
 multihash = { version = "0.16.3", default-features = false }
-fvm_shared = { version = "0.9.0", path = "../shared", features = ["crypto"] }
+fvm_shared = { version = "3.0.0-alpha.2", path = "../shared", features = ["crypto"] }
 fvm_ipld_hamt = { version = "0.5.1", path = "../ipld/hamt"}
 fvm_ipld_amt = { version = "0.4.2", path = "../ipld/amt"}
 fvm_ipld_blockstore = { version = "0.1.1", path = "../ipld/blockstore" }
@@ -36,7 +36,6 @@ rayon = "1"
 num_cpus = "1.13.0"
 log = "0.4.14"
 byteorder = "1.4.3"
-anymap = "0.12.1"
 blake2b_simd = "1.0.0"
 fvm-wasm-instrument = { version = "0.2.0", features = ["bulk"] }
 yastl = "0.1.2"
@@ -45,9 +44,10 @@ rand = "0.8.5"
 
 [dev-dependencies]
 pretty_assertions = "1.2.1"
+fvm = { path = ".", features = ["testing"], default-features = false }
 
 [dependencies.wasmtime]
-version = "0.37.0"
+version = "0.40.1"
 default-features = false
 features = ["cranelift", "pooling-allocator", "parallel-compilation"]
 
@@ -58,4 +58,3 @@ cuda = ["filecoin-proofs-api/cuda"]
 testing = []
 arb = ["arbitrary"]
 m2-native = []
-

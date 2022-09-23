@@ -1,7 +1,6 @@
 use anyhow::{anyhow, Context};
 use derive_more::{Deref, DerefMut};
 use fvm_ipld_encoding::{to_vec, RawBytes, DAG_CBOR};
-use fvm_shared::actor::builtin::Type;
 use fvm_shared::address::{Address, Protocol};
 use fvm_shared::econ::TokenAmount;
 use fvm_shared::error::{ErrorNumber, ExitCode};
@@ -33,8 +32,9 @@ pub struct InnerDefaultCallManager<M> {
     machine: M,
     /// The gas tracker.
     gas_tracker: GasTracker,
-    /// The original sender of the chain message that initiated this call stack.
-    origin: Address,
+    /// The ActorID and the address of the original sender of the chain message that initiated
+    /// this call stack. The Address is the address as provided in the chain message.
+    origin: (ActorID, Address),
     /// The nonce of the chain message that initiated this call stack.
     nonce: u64,
     /// Number of actors created in this call stack.
@@ -71,7 +71,7 @@ where
 {
     type Machine = M;
 
-    fn new(machine: M, gas_limit: i64, origin: Address, nonce: u64) -> Self {
+    fn new(machine: M, gas_limit: i64, origin: (ActorID, Address), nonce: u64) -> Self {
         let mut gas_tracker = GasTracker::new(Gas::new(gas_limit), Gas::zero());
         if machine.context().tracing {
             gas_tracker.enable_tracing()
@@ -220,8 +220,8 @@ where
 
     // Other accessor methods
 
-    fn origin(&self) -> Address {
-        self.origin
+    fn origin(&self) -> (ActorID, &Address) {
+        (self.origin.0, &self.origin.1)
     }
 
     fn nonce(&self) -> u64 {
@@ -270,10 +270,7 @@ where
 
         // Create the actor in the state tree.
         let id = {
-            let code_cid = self
-                .builtin_actors()
-                .get_by_right(&Type::Account)
-                .expect("failed to determine account actor CodeCID");
+            let code_cid = self.builtin_actors().get_account_code();
             let state = account_actor::zero_state(*code_cid);
             self.create_actor(addr, state)?
         };
@@ -295,7 +292,7 @@ where
             id,
             fvm_shared::METHOD_CONSTRUCTOR,
             Some(Block::new(DAG_CBOR, params)),
-            &TokenAmount::from(0u32),
+            &TokenAmount::zero(),
         )?;
 
         Ok(id)

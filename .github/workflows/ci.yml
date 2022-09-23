@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - master
+      - release/*
   pull_request:
 
 env:
@@ -60,7 +61,7 @@ jobs:
           - name: integration
             key: v3
             command: test
-            args: --package fvm_integration_tests --features wasm-coverage --package "*actor"
+            args: --package fvm_integration_tests --package "*actor"
           - name: conformance
             key: v3
             command: test

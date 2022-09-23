@@ -1,10 +1,10 @@
 // Copyright 2019-2022 ChainSafe Systems
 // SPDX-License-Identifier: Apache-2.0, MIT
 
+use std::fmt::{Debug, Formatter};
 use std::ops::Deref;
 use std::rc::Rc;
 
-use cid::{multihash, Cid};
 use serde::{Deserialize, Serialize};
 
 use super::errors::Error;
@@ -23,21 +23,6 @@ pub trait Cbor: ser::Serialize + de::DeserializeOwned {
     fn unmarshal_cbor(bz: &[u8]) -> Result<Self, Error> {
         from_slice(bz)
     }
-
-    /// Returns the content identifier of the raw block of data
-    /// Default is Blake2b256 hash
-    fn cid(&self) -> Result<Cid, Error> {
-        use multihash::MultihashDigest;
-        const DIGEST_SIZE: u32 = 32; // TODO get from the multihash?
-        let data = &self.marshal_cbor()?;
-        let hash = multihash::Code::Blake2b256.digest(data);
-        debug_assert_eq!(
-            u32::from(hash.size()),
-            DIGEST_SIZE,
-            "expected 32byte digest"
-        );
-        Ok(Cid::new_v1(DAG_CBOR, hash))
-    }
 }
 
 impl<T> Cbor for Vec<T> where T: Cbor {}
@@ -45,7 +30,7 @@ impl<T> Cbor for Option<T> where T: Cbor {}
 
 /// Raw serialized cbor bytes.
 /// This data is (de)serialized as a byte string.
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize, Hash, Eq, Default)]
+#[derive(Clone, PartialEq, Serialize, Deserialize, Hash, Eq, Default)]
 #[serde(transparent)]
 pub struct RawBytes {
     #[serde(with = "serde_bytes")]
@@ -100,5 +85,31 @@ impl RawBytes {
     /// Deserializes the serialized bytes into a defined type.
     pub fn deserialize<O: de::DeserializeOwned>(&self) -> Result<O, Error> {
         from_slice(&self.bytes)
+    }
+}
+
+impl Debug for RawBytes {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RawBytes {{ ")?;
+        for byte in &self.bytes {
+            write!(f, "{:02x}", byte)?;
+        }
+        write!(f, " }}")
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::RawBytes;
+
+    #[test]
+    fn debug_hex() {
+        assert_eq!("RawBytes {  }", format!("{:?}", RawBytes::from(vec![])));
+        assert_eq!("RawBytes { 00 }", format!("{:?}", RawBytes::from(vec![0])));
+        assert_eq!("RawBytes { 0f }", format!("{:?}", RawBytes::from(vec![15])));
+        assert_eq!(
+            "RawBytes { 00010a10ff }",
+            format!("{:?}", RawBytes::from(vec![0, 1, 10, 16, 255]))
+        );
     }
 }

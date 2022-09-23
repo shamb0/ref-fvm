@@ -1,6 +1,29 @@
 # Changelog
 
-## [Unreleased]
+## 3.0.0-alpha.3 [UNRELEASED]
+
+## 3.0.0-alpha.2 [2022-09-16]
+
+- Add basic f4 address support (without checksums for now).
+- Change TokenAmount::from_whole to take any `Into<BigInt>` parameter.
+- Add nv17 to the network versions.
+
+The only breaking change is the change to `Address`/`Protocol` (in case anyone is exhaustively matching on them).
+
+## 3.0.0-alpha.1 [2022-08-31]
+
+- Bump base version to v3.
+- Add `origin` to `vm::Context`.
+
+## 2.0.0...
+
+See the `release/v2` branch.
+
+- Add recover secp public key syscall.
+- Removed `actor::builtin::Type` (moved to the actors themselves).
+- Add additional hash functions to the hash syscall.
+- Add blake2b512
+- Change TokenAmount from a type alias to a struct wrapping BigInt
 
 ## 0.8.0 [2022-06-13]
 
@@ -37,7 +60,7 @@ BREAKING: Switch syscall struct alignment: https://github.com/filecoin-project/f
 Actors built against this new version of fvm_shared will be incompatible with prior FVM versions,
 and vice-versa.
 
-- Added `Display` trait to `Type` for error printing. 
+- Added `Display` trait to `Type` for error printing.
 - Added _cfg = "testing"_ on `Default` trait for `Message` structure.
 
 ## 0.5.1  [2022-04-11]
