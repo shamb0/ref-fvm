@@ -18,6 +18,7 @@ num-traits = "0.2"
 derive_builder = "0.12.0"
 num-derive = "0.3.3"
 cid = { version = "0.8.5", default-features = false, features = ["serde-codec"] }
+primitive-types = { version = "0.12", features = ["rlp", "serde"] }
 multihash = { version = "0.16.3", default-features = false }
 fvm_shared = { version = "3.0.0-alpha.20", path = "../shared", features = ["crypto"] }
 fvm_ipld_hamt = { version = "0.6.1", path = "../ipld/hamt" }

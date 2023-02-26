@@ -417,8 +417,16 @@ where
                 .builtin_actors()
                 .is_ethaccount_actor(&sender_state.code);
 
-        if self.builtin_actors().is_placeholder_actor(&sender_state.code) &&
-            sender_state.sequence == 0 &&
+        log::info!("Stg-01 :: sender_is_valid :: {:#?}", sender_is_valid);
+
+        if self
+            .builtin_actors()
+            .is_placeholder_actor(&sender_state.code)
+        {
+            sender_is_valid = true;
+        }
+
+        if sender_state.sequence == 0 &&
             sender_state
                 .delegated_address
                 .map(|a| matches!(a.payload(), Payload::Delegated(da) if da.namespace() == EAM_ACTOR_ID))
@@ -427,6 +435,32 @@ where
             sender_state.code = *self.builtin_actors().get_ethaccount_code();
         }
 
+        log::info!(
+            "is_account_actor :: {:#?}",
+            self.builtin_actors().is_account_actor(&sender_state.code)
+        );
+
+        log::info!(
+            "is_ethaccount_actor :: {:#?}",
+            self.builtin_actors()
+                .is_ethaccount_actor(&sender_state.code)
+        );
+
+        log::info!(
+            "is_placeholder_actor :: {:#?}",
+            self.builtin_actors()
+                .is_placeholder_actor(&sender_state.code)
+        );
+
+        log::info!(" sequence == 0 :: {:#?}", sender_state.sequence == 0);
+
+        log::info!("is EAM_ACTOR_ID :: {:#?}",             sender_state
+                .delegated_address
+                .map(|a| matches!(a.payload(), Payload::Delegated(da) if da.namespace() == EAM_ACTOR_ID))
+                .unwrap_or(false));
+
+        log::info!("Stg-02 :: sender_is_valid :: {:#?}", sender_is_valid);
+
         if !sender_is_valid {
             return Ok(Err(ApplyRet::prevalidation_fail(
                 ExitCode::SYS_SENDER_INVALID,
@@ -434,6 +468,8 @@ where
                 miner_penalty_amount,
             )));
         };
+
+        log::info!("Stg-03 :: sender_is_valid :: {:#?}", sender_is_valid);
 
         // Check sequence is correct
         if msg.sequence != sender_state.sequence {

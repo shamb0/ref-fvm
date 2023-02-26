@@ -425,6 +425,16 @@ impl ActorState {
 
     /// Safely deducts funds from an Actor
     pub fn deduct_funds(&mut self, amt: &TokenAmount) -> Result<()> {
+        log::info!(
+            "Self Balance :: {:#?}",
+            primitive_types::U256::from_dec_str(&format!("{}", &self.balance.atto())).unwrap()
+        );
+
+        log::info!(
+            "Deduct Amt :: {:#?}",
+            primitive_types::U256::from_dec_str(&format!("{}", &amt.atto())).unwrap()
+        );
+
         if &self.balance < amt {
             return Err(
                 syscall_error!(InsufficientFunds; "when deducting funds ({}) from balance ({})", amt, self.balance).into(),
