@@ -1,15 +1,17 @@
+// Copyright 2021-2023 Protocol Labs
+// SPDX-License-Identifier: Apache-2.0, MIT
 use fvm::executor::{ApplyKind, Executor};
+use fvm_integration_tests::bundle;
 use fvm_integration_tests::dummy::DummyExterns;
 use fvm_integration_tests::tester::{Account, Tester};
 use fvm_ipld_blockstore::MemoryBlockstore;
 use fvm_ipld_encoding::tuple::*;
 use fvm_shared::address::Address;
-use fvm_shared::bigint::BigInt;
+use fvm_shared::econ::TokenAmount;
 use fvm_shared::message::Message;
 use fvm_shared::state::StateTreeVersion;
 use fvm_shared::version::NetworkVersion;
 use num_traits::Zero;
-use wabt::wat2wasm;
 
 const WAT: &str = r#"
 ;; Mock invoke function
@@ -27,17 +29,15 @@ struct State {
 
 pub fn main() {
     // Instantiate tester
-    let mut tester = Tester::new(
-        NetworkVersion::V15,
-        StateTreeVersion::V4,
-        MemoryBlockstore::default(),
-    )
-    .unwrap();
+    let bs = MemoryBlockstore::default();
+    let bundle_root = bundle::import_bundle(&bs, actors_v10::BUNDLE_CAR).unwrap();
+    let mut tester =
+        Tester::new(NetworkVersion::V18, StateTreeVersion::V5, bundle_root, bs).unwrap();
 
     let sender: [Account; 1] = tester.create_accounts().unwrap();
 
     // Get wasm bin
-    let wasm_bin = wat2wasm(WAT).unwrap();
+    let wasm_bin = wat::parse_str(WAT).unwrap();
 
     // Set actor state
     let actor_state = State { empty: true };
@@ -47,7 +47,7 @@ pub fn main() {
     let actor_address = Address::new_id(10000);
 
     tester
-        .set_actor_from_bin(&wasm_bin, state_cid, actor_address, BigInt::zero())
+        .set_actor_from_bin(&wasm_bin, state_cid, actor_address, TokenAmount::zero())
         .unwrap();
 
     // Instantiate machine

@@ -1,9 +1,11 @@
+// Copyright 2021-2023 Protocol Labs
+// SPDX-License-Identifier: Apache-2.0, MIT
 use super::*;
 
 mod ipld {
 
     use cid::Cid;
-    use fvm::kernel::IpldBlockOps;
+    use fvm::kernel::{IpldBlockOps, SupportedHashes};
     use fvm::machine::Machine;
     use fvm_ipld_blockstore::Blockstore;
     use fvm_ipld_encoding::DAG_CBOR;
@@ -186,7 +188,10 @@ mod ipld {
                 .machine
                 .context()
                 .price_list
-                .on_block_link(expected_block.size() as usize)
+                .on_block_link(
+                    SupportedHashes::try_from(cid.hash().code()).unwrap(),
+                    expected_block.size() as usize,
+                )
                 .total();
 
             assert_eq!(
@@ -432,37 +437,34 @@ mod ipld {
 mod gas {
     use fvm::gas::*;
     use fvm::kernel::GasOps;
-    use fvm_shared::version::NetworkVersion;
-    use pretty_assertions::{assert_eq, assert_ne};
+    use pretty_assertions::assert_eq;
 
     use super::*;
+
+    const BLOCK_GAS_LIMIT: Gas = Gas::new(10_000_000_000);
 
     #[test]
     fn test() -> anyhow::Result<()> {
         let avaliable = Gas::new(10);
-        let gas_tracker = GasTracker::new(avaliable, Gas::new(0));
+        let gas_tracker = GasTracker::new(avaliable, Gas::new(0), false);
 
-        let (mut kern, _) = build_inspecting_gas_test(gas_tracker)?;
+        let (kern, _) = build_inspecting_gas_test(gas_tracker)?;
 
         assert_eq!(kern.gas_available(), avaliable);
         assert_eq!(kern.gas_used(), Gas::new(0));
 
-        kern.charge_gas("charge 6 gas", Gas::new(6))?;
+        let _ = kern.charge_gas("charge 6 gas", Gas::new(6))?;
 
         assert_eq!(kern.gas_available(), Gas::new(4));
         assert_eq!(kern.gas_used(), Gas::new(6));
 
-        kern.charge_gas("refund 6 gas", Gas::new(-6))?;
-
-        assert_eq!(kern.gas_available(), avaliable);
-        assert_eq!(kern.gas_used(), Gas::new(0));
         Ok(())
     }
 
     #[test]
     fn used() -> anyhow::Result<()> {
         let used = Gas::new(123456);
-        let gas_tracker = GasTracker::new(Gas::new(i64::MAX), used);
+        let gas_tracker = GasTracker::new(BLOCK_GAS_LIMIT, used, false);
 
         let (kern, _) = build_inspecting_gas_test(gas_tracker)?;
 
@@ -474,7 +476,7 @@ mod gas {
     #[test]
     fn available() -> anyhow::Result<()> {
         let avaliable = Gas::new(123456);
-        let gas_tracker = GasTracker::new(avaliable, Gas::new(0));
+        let gas_tracker = GasTracker::new(avaliable, Gas::new(0), false);
 
         let (kern, _) = build_inspecting_gas_test(gas_tracker)?;
 
@@ -486,13 +488,12 @@ mod gas {
     #[test]
     fn charge() -> anyhow::Result<()> {
         let test_gas = Gas::new(123456);
-        let neg_test_gas = Gas::new(-123456);
-        let gas_tracker = GasTracker::new(test_gas, Gas::new(0));
+        let gas_tracker = GasTracker::new(test_gas, Gas::new(0), false);
 
-        let (mut kern, _) = build_inspecting_gas_test(gas_tracker)?;
+        let (kern, _) = build_inspecting_gas_test(gas_tracker)?;
 
         // charge exactly as much as avaliable
-        kern.charge_gas("test test 123", test_gas)?;
+        let _ = kern.charge_gas("test test 123", test_gas)?;
         assert_eq!(kern.gas_used(), test_gas);
 
         // charge over by 1
@@ -504,25 +505,9 @@ mod gas {
             "charging gas over what is avaliable and failing should not affect gas used"
         );
 
-        // charge negative (refund) gas
-        kern.charge_gas("refund~", neg_test_gas)?;
-        assert_eq!(kern.gas_used(), Gas::new(0));
-        kern.charge_gas("free gas!", neg_test_gas)?;
-
-        assert_eq!(
-            kern.gas_used(),
-            neg_test_gas,
-            "gas avaliable should be negative"
-        );
-        assert_eq!(
-            kern.gas_available() + kern.gas_used(),
-            test_gas,
-            "gas avaliable + gas used should be equal to the gas limit"
-        );
-
         // kernel with 0 avaliable gas
-        let gas_tracker = GasTracker::new(Gas::new(0), Gas::new(0));
-        let (mut kern, _) = build_inspecting_gas_test(gas_tracker)?;
+        let gas_tracker = GasTracker::new(Gas::new(0), Gas::new(0), false);
+        let (kern, _) = build_inspecting_gas_test(gas_tracker)?;
         expect_out_of_gas!(kern.charge_gas("spend more!", test_gas));
 
         Ok(())
@@ -539,9 +524,6 @@ mod gas {
             "price list should be the same as the one used in the kernel {}",
             STUB_NETWORK_VER
         );
-
-        let unexpected_list = price_list_by_network_version(NetworkVersion::V16);
-        assert_ne!(kern.price_list(), unexpected_list);
 
         Ok(())
     }

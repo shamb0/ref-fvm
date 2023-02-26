@@ -1,3 +1,4 @@
+// Copyright 2021-2023 Protocol Labs
 // Copyright 2019-2022 ChainSafe Systems
 // SPDX-License-Identifier: Apache-2.0, MIT
 
@@ -11,7 +12,8 @@ use serde::de::{self, DeserializeOwned};
 use serde::{ser, Deserialize, Deserializer, Serialize, Serializer};
 
 use super::node::Node;
-use super::{Error, Hash, HashAlgorithm, KeyValuePair, MAX_ARRAY_WIDTH};
+use super::{Error, Hash, HashAlgorithm, KeyValuePair};
+use crate::Config;
 
 /// Pointer to index values or a link to another child node.
 #[derive(Debug)]
@@ -63,8 +65,7 @@ where
     fn try_from(ipld: Ipld) -> Result<Self, Self::Error> {
         match ipld {
             ipld_list @ Ipld::List(_) => {
-                let values: Vec<KeyValuePair<K, V>> =
-                    Deserialize::deserialize(ipld_list).map_err(|error| error.to_string())?;
+                let values: Vec<KeyValuePair<K, V>> = from_ipld(ipld_list)?;
                 Ok(Self::Values(values))
             }
             Ipld::Link(cid) => Ok(Self::Link {
@@ -111,10 +112,16 @@ where
 
     /// Internal method to cleanup children, to ensure consistent tree representation
     /// after deletes.
-    pub(crate) fn clean(&mut self) -> Result<(), Error> {
+    pub(crate) fn clean(&mut self, conf: &Config, depth: u32) -> Result<(), Error> {
         match self {
             Pointer::Dirty(n) => match n.pointers.len() {
                 0 => Err(Error::ZeroPointers),
+                _ if depth < conf.min_data_depth => {
+                    // We are in the shallows where we don't want key-value pairs, just links,
+                    // so as long as they are pointing at non-empty nodes we can keep them.
+                    // The rest of the rules would move key-value pairs up.
+                    Ok(())
+                }
                 1 => {
                     // Node has only one pointer, swap with parent node
                     if let Pointer::Values(vals) = &mut n.pointers[0] {
@@ -126,7 +133,7 @@ where
                     }
                     Ok(())
                 }
-                2..=MAX_ARRAY_WIDTH => {
+                i if 2 <= i && i <= conf.max_array_width => {
                     // If more child values than max width, nothing to change.
                     let mut children_len = 0;
                     for c in n.pointers.iter() {
@@ -136,7 +143,7 @@ where
                             return Ok(());
                         }
                     }
-                    if children_len > MAX_ARRAY_WIDTH {
+                    if children_len > conf.max_array_width {
                         return Ok(());
                     }
 
@@ -169,4 +176,8 @@ where
             _ => unreachable!("clean is only called on dirty pointer"),
         }
     }
+}
+
+fn from_ipld<T: DeserializeOwned>(ipld: Ipld) -> Result<T, String> {
+    Deserialize::deserialize(ipld).map_err(|error| error.to_string())
 }

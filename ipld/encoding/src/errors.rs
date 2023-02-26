@@ -1,3 +1,4 @@
+// Copyright 2021-2023 Protocol Labs
 // Copyright 2019-2022 ChainSafe Systems
 // SPDX-License-Identifier: Apache-2.0, MIT
 
@@ -11,7 +12,7 @@ use thiserror::Error;
 ///
 /// This error will provide any details about the data which was attempted to be
 /// encoded or decoded.
-#[derive(Debug, PartialEq, Error)]
+#[derive(Debug, PartialEq, Eq, Error)]
 #[error("Serialization error for {protocol} protocol: {description}")]
 pub struct Error {
     pub description: String,
@@ -55,15 +56,20 @@ impl From<Error> for io::Error {
 ///
 /// This is used with the encoding errors, to detail the encoding protocol or any other
 /// information about how the data was encoded or decoded
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum CodecProtocol {
+    Unsupported,
     Cbor,
+    Raw,
 }
 
 impl fmt::Display for CodecProtocol {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
+            CodecProtocol::Unsupported => write!(f, "Unsupported"),
             CodecProtocol::Cbor => write!(f, "Cbor"),
+            CodecProtocol::Raw => write!(f, "Raw"),
         }
     }
 }

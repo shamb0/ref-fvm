@@ -1,3 +1,5 @@
+// Copyright 2021-2023 Protocol Labs
+// SPDX-License-Identifier: Apache-2.0, MIT
 use std::mem;
 
 use fvm_shared::error::ErrorNumber;
@@ -95,7 +97,7 @@ fn memory_and_data<'a, K: Kernel>(
 macro_rules! charge_syscall_gas {
     ($kernel:expr) => {
         let charge = $kernel.price_list().on_syscall();
-        $kernel
+        let _ = $kernel
             .charge_gas(&charge.name, charge.compute_gas)
             .map_err(Abort::from_error_as_fatal)?;
     };
@@ -199,3 +201,4 @@ impl_bind_syscalls!(A B C D);
 impl_bind_syscalls!(A B C D E);
 impl_bind_syscalls!(A B C D E F);
 impl_bind_syscalls!(A B C D E F G);
+impl_bind_syscalls!(A B C D E F G H);

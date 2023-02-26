@@ -1,15 +1,20 @@
+// Copyright 2021-2023 Protocol Labs
+// SPDX-License-Identifier: Apache-2.0, MIT
 extern crate criterion;
 use std::env::var;
 use std::path::Path;
 use std::time::Duration;
 
 use criterion::*;
-use fvm::machine::{MultiEngine, BURNT_FUNDS_ACTOR_ADDR};
+use fvm::engine::MultiEngine;
+use fvm::machine::BURNT_FUNDS_ACTOR_ID;
 use fvm_conformance_tests::driver::*;
 use fvm_conformance_tests::vector::{ApplyMessage, MessageVector};
-use fvm_ipld_encoding::{Cbor, RawBytes};
+use fvm_ipld_encoding::RawBytes;
+use fvm_shared::address::Address;
 use fvm_shared::econ::TokenAmount;
 use fvm_shared::message::Message;
+use num_traits::Zero;
 use walkdir::WalkDir;
 
 mod bench_drivers;
@@ -47,19 +52,18 @@ fn bench_500_simple_state_access(
 ) -> anyhow::Result<()> {
     let five_hundred_state_accesses = (0..500)
         .map(|i| ApplyMessage {
-            bytes: Message {
+            bytes: fvm_ipld_encoding::to_vec(&Message {
                 version: 0,
-                from: BURNT_FUNDS_ACTOR_ADDR,
-                to: BURNT_FUNDS_ACTOR_ADDR,
+                from: Address::new_id(BURNT_FUNDS_ACTOR_ID),
+                to: Address::new_id(BURNT_FUNDS_ACTOR_ID),
                 sequence: i,
-                value: TokenAmount::from(0u8),
+                value: TokenAmount::zero(),
                 method_num: 2,
                 params: RawBytes::default(),
                 gas_limit: 5000000000,
-                gas_fee_cap: TokenAmount::from(0u8),
-                gas_premium: TokenAmount::from(0u8),
-            }
-            .marshal_cbor()
+                gas_fee_cap: TokenAmount::zero(),
+                gas_premium: TokenAmount::zero(),
+            })
             .unwrap(),
             epoch_offset: None,
         })

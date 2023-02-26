@@ -1,14 +1,14 @@
+// Copyright 2021-2023 Protocol Labs
 // Copyright 2019-2022 ChainSafe Systems
 // SPDX-License-Identifier: Apache-2.0, MIT
 
 use fvm_ipld_encoding::tuple::*;
-use fvm_ipld_encoding::Cbor;
 
 use crate::bigint::{bigint_ser, BigInt, Integer};
 use crate::clock::ChainEpoch;
 use crate::math::PRECISION;
 
-#[derive(Default, Serialize_tuple, Deserialize_tuple, Clone, Debug, PartialEq)]
+#[derive(Default, Serialize_tuple, Deserialize_tuple, Clone, Debug, PartialEq, Eq)]
 pub struct FilterEstimate {
     #[serde(with = "bigint_ser")]
     pub position: BigInt,
@@ -37,8 +37,6 @@ impl FilterEstimate {
         (&self.velocity * delta_t) + position
     }
 }
-
-impl Cbor for FilterEstimate {}
 
 pub struct AlphaBetaFilter<'a, 'b, 'f> {
     alpha: &'a BigInt,

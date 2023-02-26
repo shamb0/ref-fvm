@@ -1,3 +1,5 @@
+// Copyright 2021-2023 Protocol Labs
+// SPDX-License-Identifier: Apache-2.0, MIT
 pub use blocks::{Block, BlockId, BlockRegistry, BlockStat};
 use cid::Cid;
 use fvm_shared::address::Address;
@@ -14,24 +16,32 @@ use fvm_shared::sector::{
     AggregateSealVerifyProofAndInfos, RegisteredSealProof, ReplicaUpdateInfo, SealVerifyInfo,
     WindowPoStVerifyInfo,
 };
-use fvm_shared::version::NetworkVersion;
-use fvm_shared::{actor, ActorID, MethodNum};
+use fvm_shared::sys::out::network::NetworkContext;
+use fvm_shared::sys::out::vm::MessageContext;
+use fvm_shared::sys::SendFlags;
+use fvm_shared::{ActorID, MethodNum};
+
+mod hash;
 
 mod blocks;
 pub mod default;
 
-mod error;
+pub(crate) mod error;
 
 pub use error::{ClassifyResult, Context, ExecutionError, Result, SyscallError};
+use fvm_shared::event::StampedEvent;
+pub use hash::SupportedHashes;
 use multihash::MultihashGeneric;
 
 use crate::call_manager::CallManager;
-use crate::gas::{Gas, PriceList};
+use crate::gas::{Gas, GasTimer, PriceList};
+use crate::machine::limiter::MemoryLimiter;
 use crate::machine::Machine;
 
-pub enum SendResult {
-    Return(BlockId, BlockStat),
-    Abort(ExitCode),
+pub struct SendResult {
+    pub block_id: BlockId,
+    pub block_stat: BlockStat,
+    pub exit_code: ExitCode,
 }
 
 /// The "kernel" implements the FVM interface as presented to the actors. It:
@@ -47,12 +57,14 @@ pub trait Kernel:
     + CircSupplyOps
     + CryptoOps
     + DebugOps
+    + EventOps
     + GasOps
     + MessageOps
     + NetworkOps
     + RandomnessOps
     + SelfOps
     + SendOps
+    + LimiterOps
     + 'static
 {
     /// The [`Kernel`]'s [`CallManager`] is
@@ -70,6 +82,7 @@ pub trait Kernel:
     /// - `method` is the method that has been invoked.
     /// - `value_received` is value received due to the current call.
     /// - `blocks` is the initial block registry (should already contain the parameters).
+    #[allow(clippy::too_many_arguments)]
     fn new(
         mgr: Self::CallManager,
         blocks: BlockRegistry,
@@ -77,36 +90,28 @@ pub trait Kernel:
         actor_id: ActorID,
         method: MethodNum,
         value_received: TokenAmount,
+        read_only: bool,
     ) -> Self
     where
         Self: Sized;
+
+    /// The kernel's underlying "machine".
+    fn machine(&self) -> &<Self::CallManager as CallManager>::Machine;
 }
 
 /// Network-related operations.
 pub trait NetworkOps {
-    /// The current network epoch (constant).
-    fn network_epoch(&self) -> ChainEpoch;
+    /// Network information (epoch, version, etc.).
+    fn network_context(&self) -> Result<NetworkContext>;
 
-    /// The current network version (constant).
-    fn network_version(&self) -> NetworkVersion;
-
-    /// The current base-fee (constant).
-    fn network_base_fee(&self) -> &TokenAmount;
+    /// The CID of the tipset at the specified epoch.
+    fn tipset_cid(&self, epoch: ChainEpoch) -> Result<Cid>;
 }
 
 /// Accessors to query attributes of the incoming message.
 pub trait MessageOps {
-    /// The calling actor (constant).
-    fn msg_caller(&self) -> ActorID;
-
-    /// The receiving actor (this actor) (constant).
-    fn msg_receiver(&self) -> ActorID;
-
-    /// The method number used to invoke this actor (constant).
-    fn msg_method_number(&self) -> MethodNum;
-
-    /// The value received from the caller (constant).
-    fn msg_value_received(&self) -> TokenAmount;
+    /// Message information.
+    fn msg_context(&self) -> Result<MessageContext>;
 }
 
 /// The IPLD subset of the kernel.
@@ -133,12 +138,12 @@ pub trait IpldBlockOps {
     /// Read data from a block.
     ///
     /// This method will fail if the block handle is invalid.
-    fn block_read(&mut self, id: BlockId, offset: u32, buf: &mut [u8]) -> Result<i32>;
+    fn block_read(&self, id: BlockId, offset: u32, buf: &mut [u8]) -> Result<i32>;
 
     /// Returns the blocks codec & size.
     ///
     /// This method will fail if the block handle is invalid.
-    fn block_stat(&mut self, id: BlockId) -> Result<BlockStat>;
+    fn block_stat(&self, id: BlockId) -> Result<BlockStat>;
 }
 
 /// Actor state access and manipulation.
@@ -167,30 +172,41 @@ pub trait ActorOps {
     /// Resolves an address of any protocol to an ID address (via the Init actor's table).
     /// This allows resolution of externally-provided SECP, BLS, or actor addresses to the canonical form.
     /// If the argument is an ID address it is returned directly.
-    fn resolve_address(&self, address: &Address) -> Result<Option<ActorID>>;
+    fn resolve_address(&self, address: &Address) -> Result<ActorID>;
+
+    /// Looks up the "delegated" (f4) address of the specified actor, if any.
+    fn lookup_delegated_address(&self, actor_id: ActorID) -> Result<Option<Address>>;
 
     /// Look up the code CID of an actor.
-    fn get_actor_code_cid(&self, id: ActorID) -> Result<Option<Cid>>;
+    fn get_actor_code_cid(&self, id: ActorID) -> Result<Cid>;
 
     /// Computes an address for a new actor. The returned address is intended to uniquely refer to
     /// the actor even in the event of a chain re-org (whereas an ID-address might refer to a
     /// different actor after messages are re-ordered).
     /// Always an ActorExec address.
-    fn new_actor_address(&mut self) -> Result<Address>;
+    fn next_actor_address(&self) -> Result<Address>;
 
-    /// Creates an actor with code `code_cid` and id `actor_id`, with empty state.
-    /// May only be called by Init actor.
-    fn create_actor(&mut self, code_cid: Cid, actor_id: ActorID) -> Result<()>;
+    /// Creates an actor with given `code_cid`, `actor_id`, `delegated_address` (if specified),
+    /// and an empty state.
+    fn create_actor(
+        &mut self,
+        code_cid: Cid,
+        actor_id: ActorID,
+        delegated_address: Option<Address>,
+    ) -> Result<()>;
 
     /// Installs actor code pointed by cid
     #[cfg(feature = "m2-native")]
     fn install_actor(&mut self, code_cid: Cid) -> Result<()>;
 
-    /// Returns whether the supplied code_cid belongs to a known built-in actor type.
-    fn get_builtin_actor_type(&self, code_cid: &Cid) -> Option<actor::builtin::Type>;
+    /// Returns the actor's "type" (if builitin) or 0 (if not).
+    fn get_builtin_actor_type(&self, code_cid: &Cid) -> Result<u32>;
 
     /// Returns the CodeCID for the supplied built-in actor type.
-    fn get_code_cid_for_type(&self, typ: actor::builtin::Type) -> Result<Cid>;
+    fn get_code_cid_for_type(&self, typ: u32) -> Result<Cid>;
+
+    /// Returns the balance associated with an actor id
+    fn balance_of(&self, actor_id: ActorID) -> Result<TokenAmount>;
 }
 
 /// Operations to send messages to other actors.
@@ -201,6 +217,8 @@ pub trait SendOps {
         method: u64,
         params: BlockId,
         value: &TokenAmount,
+        gas_limit: Option<Gas>,
+        flags: SendFlags,
     ) -> Result<SendResult>;
 }
 
@@ -227,7 +245,7 @@ pub trait GasOps {
 
     /// ChargeGas charges specified amount of `gas` for execution.
     /// `name` provides information about gas charging point.
-    fn charge_gas(&mut self, name: &str, compute: Gas) -> Result<()>;
+    fn charge_gas(&self, name: &str, compute: Gas) -> Result<GasTimer>;
 
     /// Returns the currently active gas price list.
     fn price_list(&self) -> &PriceList;
@@ -237,7 +255,7 @@ pub trait GasOps {
 pub trait CryptoOps {
     /// Verifies that a signature is valid for an address and plaintext.
     fn verify_signature(
-        &mut self,
+        &self,
         sig_type: SignatureType,
         signature: &[u8],
         signer: &Address,
@@ -246,7 +264,7 @@ pub trait CryptoOps {
 
     /// Given a message hash and its signature, recovers the public key of the signer.
     fn recover_secp_public_key(
-        &mut self,
+        &self,
         hash: &[u8; SECP_SIG_MESSAGE_HASH_SIZE],
         signature: &[u8; SECP_SIG_LEN],
     ) -> Result<[u8; SECP_PUB_LEN]>;
@@ -255,20 +273,20 @@ pub trait CryptoOps {
     /// `digest_out`, returning the size of the digest written to `digest_out`. If `digest_out` is
     /// to small to fit the entire digest, it will be truncated. If too large, the leftover space
     /// will not be overwritten.
-    fn hash(&mut self, code: u64, data: &[u8]) -> Result<MultihashGeneric<64>>;
+    fn hash(&self, code: u64, data: &[u8]) -> Result<MultihashGeneric<64>>;
 
     /// Computes an unsealed sector CID (CommD) from its constituent piece CIDs (CommPs) and sizes.
     fn compute_unsealed_sector_cid(
-        &mut self,
+        &self,
         proof_type: RegisteredSealProof,
         pieces: &[PieceInfo],
     ) -> Result<Cid>;
 
     /// Verifies a sector seal proof.
-    fn verify_seal(&mut self, vi: &SealVerifyInfo) -> Result<bool>;
+    fn verify_seal(&self, vi: &SealVerifyInfo) -> Result<bool>;
 
     /// Verifies a window proof of spacetime.
-    fn verify_post(&mut self, verify_info: &WindowPoStVerifyInfo) -> Result<bool>;
+    fn verify_post(&self, verify_info: &WindowPoStVerifyInfo) -> Result<bool>;
 
     /// Verifies that two block headers provide proof of a consensus fault:
     /// - both headers mined by the same actor
@@ -281,7 +299,7 @@ pub trait CryptoOps {
     /// blocks in the parent of h2 (i.e. h2's grandparent).
     /// Returns nil and an error if the headers don't prove a fault.
     fn verify_consensus_fault(
-        &mut self,
+        &self,
         h1: &[u8],
         h2: &[u8],
         extra: &[u8],
@@ -292,17 +310,14 @@ pub trait CryptoOps {
     ///
     /// Gas: This syscall intentionally _does not_ charge any gas (as said gas would be charged to
     /// cron). Instead, gas is pre-paid by the storage provider on pre-commit.
-    fn batch_verify_seals(&mut self, vis: &[SealVerifyInfo]) -> Result<Vec<bool>>;
+    fn batch_verify_seals(&self, vis: &[SealVerifyInfo]) -> Result<Vec<bool>>;
 
     /// Verify aggregate seals verifies an aggregated batch of prove-commits.
-    fn verify_aggregate_seals(
-        &mut self,
-        aggregate: &AggregateSealVerifyProofAndInfos,
-    ) -> Result<bool>;
+    fn verify_aggregate_seals(&self, aggregate: &AggregateSealVerifyProofAndInfos) -> Result<bool>;
 
     /// Verify replica update verifies a snap deal: an upgrade from a CC sector to a sector with
     /// deals.
-    fn verify_replica_update(&mut self, replica: &ReplicaUpdateInfo) -> Result<bool>;
+    fn verify_replica_update(&self, replica: &ReplicaUpdateInfo) -> Result<bool>;
 }
 
 /// Randomness queries.
@@ -311,7 +326,7 @@ pub trait RandomnessOps {
     /// ticket chain from a given epoch and incorporating requisite entropy.
     /// This randomness is fork dependant but also biasable because of this.
     fn get_randomness_from_tickets(
-        &mut self,
+        &self,
         personalization: i64,
         rand_epoch: ChainEpoch,
         entropy: &[u8],
@@ -321,7 +336,7 @@ pub trait RandomnessOps {
     /// beacon from a given epoch and incorporating requisite entropy.
     /// This randomness is not tied to any fork of the chain, and is unbiasable.
     fn get_randomness_from_beacon(
-        &mut self,
+        &self,
         personalization: i64,
         rand_epoch: ChainEpoch,
         entropy: &[u8],
@@ -339,4 +354,21 @@ pub trait DebugOps {
     /// Store an artifact.
     /// Returns error on malformed name, returns Ok and logs the error on system/os errors.
     fn store_artifact(&self, name: &str, data: &[u8]) -> Result<()>;
+}
+
+/// Track and limit memory expansion.
+///
+/// This interface is not one of the operations the kernel provides to actors.
+/// It's only part of the kernel out of necessity to pass it through to the
+/// call manager which tracks the limits across the whole execution stack.
+pub trait LimiterOps {
+    type Limiter: MemoryLimiter;
+    /// Give access to the limiter of the underlying call manager.
+    fn limiter_mut(&mut self) -> &mut Self::Limiter;
+}
+
+/// Eventing APIs.
+pub trait EventOps {
+    /// Records an event emitted throughout execution.
+    fn emit_event(&mut self, raw_evt: &[u8]) -> Result<()>;
 }

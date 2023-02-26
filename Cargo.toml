@@ -6,8 +6,11 @@ members = [
     "shared",
     "testing/conformance",
     "testing/integration",
+    "testing/calibration",
     "ipld/*",
-    "testing/integration/tests/*"
+    "testing/integration/tests/*-actor",
+    "testing/calibration/contract/*-actor",
+    "tools/fvm-bench",
 ]
 
 [profile.actor]

@@ -1,34 +1,37 @@
+// Copyright 2021-2023 Protocol Labs
+// SPDX-License-Identifier: Apache-2.0, MIT
 use std::ops::RangeInclusive;
 
 use anyhow::{anyhow, Context as _};
 use cid::Cid;
-use fvm_ipld_blockstore::{Blockstore, Buffered};
-use fvm_ipld_encoding::CborStore;
-use fvm_shared::actor::builtin::{load_manifest, Manifest};
-use fvm_shared::address::Address;
-use fvm_shared::econ::TokenAmount;
-use fvm_shared::error::ErrorNumber;
+use fvm_ipld_blockstore::{Block, Blockstore, Buffered};
+use fvm_ipld_encoding::{to_vec, CborStore, DAG_CBOR};
 use fvm_shared::version::NetworkVersion;
-use fvm_shared::ActorID;
 use log::debug;
-use num_traits::Signed;
+use multihash::Code::Blake2b256;
 
-use super::{Engine, Machine, MachineContext};
+use super::{Machine, MachineContext};
 use crate::blockstore::BufferedBlockstore;
 use crate::externs::Externs;
 #[cfg(feature = "m2-native")]
 use crate::init_actor::State as InitActorState;
-use crate::kernel::{ClassifyResult, Context as _, Result};
-use crate::state_tree::{ActorState, StateTree};
-use crate::syscall_error;
+use crate::kernel::{ClassifyResult, Result};
+use crate::machine::limiter::DefaultMemoryLimiter;
+use crate::machine::Manifest;
+use crate::state_tree::StateTree;
 use crate::system_actor::State as SystemActorState;
+use crate::EMPTY_ARR_CID;
+
+lazy_static::lazy_static! {
+    /// Pre-serialized block containing the empty array
+    pub static ref EMPTY_ARRAY_BLOCK: Block<Vec<u8>> = {
+        Block::new(DAG_CBOR, to_vec::<[(); 0]>(&[]).unwrap())
+    };
+}
 
 pub struct DefaultMachine<B, E> {
     /// The initial execution context for this epoch.
     context: MachineContext,
-    /// The WASM engine is created on construction of the DefaultMachine, and
-    /// is dropped when the DefaultMachine is dropped.
-    engine: Engine,
     /// Boundary A calls are handled through externs. These are calls from the
     /// FVM to the Filecoin client.
     externs: E,
@@ -53,19 +56,18 @@ where
     ///
     /// # Arguments
     ///
-    /// * `engine`: The global wasm [`Engine`] (engine, pooled resources, caches).
     /// * `context`: Machine execution [context][`MachineContext`] (system params, epoch, network
     ///    version, etc.).
     /// * `blockstore`: The underlying [blockstore][`Blockstore`] for reading/writing state.
     /// * `externs`: Client-provided ["external"][`Externs`] methods for accessing chain state.
-    pub fn new(
-        engine: &Engine,
-        context: &MachineContext,
-        blockstore: B,
-        externs: E,
-    ) -> anyhow::Result<Self> {
+    pub fn new(context: &MachineContext, blockstore: B, externs: E) -> anyhow::Result<Self> {
+        #[cfg(not(feature = "hyperspace"))]
         const SUPPORTED_VERSIONS: RangeInclusive<NetworkVersion> =
-            NetworkVersion::V15..=NetworkVersion::V16;
+            NetworkVersion::V18..=NetworkVersion::V18;
+
+        #[cfg(feature = "hyperspace")]
+        const SUPPORTED_VERSIONS: RangeInclusive<NetworkVersion> =
+            NetworkVersion::V18..=NetworkVersion::MAX;
 
         debug!(
             "initializing a new machine, epoch={}, base_fee={}, nv={:?}, root={}",
@@ -90,6 +92,8 @@ where
             ));
         }
 
+        put_empty_blocks(&blockstore)?;
+
         // Create a new state tree from the supplied root.
         let state_tree = {
             let bstore = BufferedBlockstore::new(blockstore);
@@ -111,45 +115,20 @@ where
             }
         };
         let builtin_actors =
-            load_manifest(state_tree.store(), &builtin_actors_cid, manifest_version)?;
-
-        // Preload any uncached modules.
-        // This interface works for now because we know all actor CIDs
-        // ahead of time, but with user-supplied code, we won't have that
-        // guarantee.
-        // Skip preloading all builtin actors when testing. This results in JIT
-        // bytecode to machine code compilation, and leads to faster tests.
-        #[cfg(not(any(test, feature = "testing")))]
-        engine.preload(state_tree.store(), builtin_actors.left_values())?;
-
-        #[cfg(feature = "m2-native")]
-        {
-            // preload user actors that have been installed
-            // TODO This must be revisited when implementing the actively managed cache.
-            // Doesn't need the m2-native feature guard because there's no possiblity
-            // for user code to install new actors if that feature is disabled anyway
-            // (so this would be a no-op). We could add the guard as an optimization, though.
-            let (init_state, _) = InitActorState::load(&state_tree)?;
-            let installed_actors: Vec<Cid> = state_tree
-                .store()
-                .get_cbor(&init_state.installed_actors)?
-                .context("failed to load installed actor list")?;
-            engine.preload(state_tree.store(), &installed_actors)?;
-        }
+            Manifest::load(state_tree.store(), &builtin_actors_cid, manifest_version)?;
 
         // 16 bytes is random _enough_
         let randomness: [u8; 16] = rand::random();
 
         Ok(DefaultMachine {
             context: context.clone(),
-            engine: engine.clone(),
             externs,
             state_tree,
             builtin_actors,
             id: format!(
                 "{}-{}",
                 context.epoch,
-                cid::multibase::encode(cid::multibase::Base::Base32Lower, &randomness)
+                cid::multibase::encode(cid::multibase::Base::Base32Lower, randomness)
             ),
         })
     }
@@ -162,10 +141,7 @@ where
 {
     type Blockstore = BufferedBlockstore<B>;
     type Externs = E;
-
-    fn engine(&self) -> &Engine {
-        &self.engine
-    }
+    type Limiter = DefaultMemoryLimiter;
 
     fn blockstore(&self) -> &Self::Blockstore {
         self.state_tree.store()
@@ -202,63 +178,6 @@ where
         Ok(root)
     }
 
-    /// Creates an uninitialized actor.
-    fn create_actor(&mut self, addr: &Address, act: ActorState) -> Result<ActorID> {
-        let state_tree = self.state_tree_mut();
-
-        let addr_id = state_tree
-            .register_new_address(addr)
-            .context("failed to register new address")
-            .or_fatal()?;
-
-        state_tree
-            .set_actor(&Address::new_id(addr_id), act)
-            .context("failed to set actor")
-            .or_fatal()?;
-        Ok(addr_id)
-    }
-
-    fn transfer(&mut self, from: ActorID, to: ActorID, value: &TokenAmount) -> Result<()> {
-        if value.is_negative() {
-            return Err(syscall_error!(IllegalArgument;
-                "attempted to transfer negative transfer value {}", value)
-            .into());
-        }
-
-        // If the from actor doesn't exist, we return "insufficient funds" to distinguish between
-        // that and the case where the _receiving_ actor doesn't exist.
-        let mut from_actor = self
-            .state_tree
-            .get_actor_id(from)?
-            .context("cannot transfer from non-existent sender")
-            .or_error(ErrorNumber::InsufficientFunds)?;
-
-        if &from_actor.balance < value {
-            return Err(syscall_error!(InsufficientFunds; "sender does not have funds to transfer (balance {}, transfer {})", &from_actor.balance, value).into());
-        }
-
-        if from == to {
-            debug!("attempting to self-transfer: noop (from/to: {})", from);
-            return Ok(());
-        }
-
-        let mut to_actor = self
-            .state_tree
-            .get_actor_id(to)?
-            .context("cannot transfer to non-existent receiver")
-            .or_error(ErrorNumber::NotFound)?;
-
-        from_actor.deduct_funds(value)?;
-        to_actor.deposit_funds(value);
-
-        self.state_tree.set_actor_id(from, from_actor)?;
-        self.state_tree.set_actor_id(to, to_actor)?;
-
-        log::trace!("transferred {} from {} to {}", value, from, to);
-
-        Ok(())
-    }
-
     fn into_store(self) -> Self::Blockstore {
         self.state_tree.into_store()
     }
@@ -266,4 +185,21 @@ where
     fn machine_id(&self) -> &str {
         &self.id
     }
+
+    fn new_limiter(&self) -> Self::Limiter {
+        DefaultMemoryLimiter::for_network(&self.context().network)
+    }
+}
+
+// Helper method that puts certain "empty" types in the blockstore.
+// These types are privileged by some parts of the system (eg. as the default actor state).
+fn put_empty_blocks<B: Blockstore>(blockstore: B) -> anyhow::Result<()> {
+    let empty_arr_cid = blockstore.put(Blake2b256, &EMPTY_ARRAY_BLOCK)?;
+
+    debug_assert!(
+        empty_arr_cid == *EMPTY_ARR_CID,
+        "empty CID sanity check failed",
+    );
+
+    Ok(())
 }

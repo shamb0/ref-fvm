@@ -1,3 +1,4 @@
+// Copyright 2021-2023 Protocol Labs
 // Copyright 2019-2022 ChainSafe Systems
 // SPDX-License-Identifier: Apache-2.0, MIT
 
@@ -80,6 +81,8 @@ impl Selector {
     pub fn supported(&self) -> bool {
         self.chaos_actor.as_deref() != Some("true")
             && self.consensus_fault.as_deref() != Some("true")
+            // Chocolate requires Network Version 14 which `TestMachine::import_actors` no longer loads.
+            && self.min_protocol_version.as_deref() != Some("chocolate")
     }
 }
 
@@ -101,7 +104,7 @@ pub struct RandomnessMatch {
     pub ret: Vec<u8>,
 }
 
-#[derive(Debug, Deserialize, PartialEq, Clone)]
+#[derive(Debug, Deserialize, PartialEq, Eq, Clone)]
 #[serde(rename_all = "lowercase")]
 pub enum RandomnessKind {
     Beacon,
@@ -109,7 +112,7 @@ pub enum RandomnessKind {
 }
 
 /// Rule for matching when randomness is returned.
-#[derive(Debug, Deserialize_tuple, PartialEq, Clone)]
+#[derive(Debug, Deserialize_tuple, PartialEq, Eq, Clone)]
 pub struct RandomnessRule {
     pub kind: RandomnessKind,
     pub dst: i64,
@@ -214,6 +217,7 @@ pub struct ApplyMessage {
 mod base64_bytes {
     use std::borrow::Cow;
 
+    use base64::Engine;
     use serde::de;
 
     use super::*;
@@ -223,7 +227,9 @@ mod base64_bytes {
         D: Deserializer<'de>,
     {
         let s: Cow<'de, str> = Deserialize::deserialize(deserializer)?;
-        base64::decode(s.as_ref()).map_err(de::Error::custom)
+        base64::engine::general_purpose::STANDARD
+            .decode(s.as_ref())
+            .map_err(de::Error::custom)
     }
 }
 
@@ -238,7 +244,7 @@ mod message_receipt_vec {
         exit_code: ExitCode,
         #[serde(rename = "return", with = "base64_bytes")]
         return_value: Vec<u8>,
-        gas_used: i64,
+        gas_used: u64,
     }
 
     pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<Receipt>, D::Error>
@@ -251,6 +257,7 @@ mod message_receipt_vec {
                 exit_code: v.exit_code,
                 return_data: RawBytes::new(v.return_value),
                 gas_used: v.gas_used,
+                events_root: None,
             })
             .collect())
     }

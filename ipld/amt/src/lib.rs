@@ -1,3 +1,4 @@
+// Copyright 2021-2023 Protocol Labs
 // Copyright 2019-2022 ChainSafe Systems
 // SPDX-License-Identifier: Apache-2.0, MIT
 
@@ -12,10 +13,9 @@ mod node;
 mod root;
 mod value_mut;
 
-pub use self::amt::Amt;
+pub use self::amt::{Amt, Amtv0};
 pub use self::error::Error;
 pub(crate) use self::node::Node;
-pub(crate) use self::root::Root;
 pub use self::value_mut::ValueMut;
 
 const DEFAULT_BIT_WIDTH: u32 = 3;

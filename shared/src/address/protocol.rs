@@ -1,3 +1,4 @@
+// Copyright 2021-2023 Protocol Labs
 // Copyright 2019-2022 ChainSafe Systems
 // SPDX-License-Identifier: Apache-2.0, MIT
 
@@ -19,6 +20,8 @@ pub enum Protocol {
     Actor = 2,
     /// BLS key addressing
     BLS = 3,
+    /// Delegated actor protocol addressing
+    Delegated = 4,
 }
 
 impl Protocol {

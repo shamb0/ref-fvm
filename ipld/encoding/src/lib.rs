@@ -1,3 +1,4 @@
+// Copyright 2021-2023 Protocol Labs
 // Copyright 2019-2022 ChainSafe Systems
 // SPDX-License-Identifier: Apache-2.0, MIT
 
@@ -5,17 +6,27 @@ mod bytes;
 mod cbor;
 mod cbor_store;
 mod errors;
+pub mod ipld_block;
+mod raw;
 mod vec;
 use std::io;
 
 pub use serde::{self, de, ser};
-pub use serde_bytes;
 
 pub use self::bytes::*;
 pub use self::cbor::*;
 pub use self::cbor_store::CborStore;
 pub use self::errors::*;
 pub use self::vec::*;
+
+/// CBOR should be used to pass CBOR data when internal links don't need to be
+/// traversable/reachable. When a CBOR block is loaded, said links will not be added to the
+/// reachable set.
+pub const CBOR: u64 = 0x51;
+/// DagCBOR should be used for all IPLD-CBOR data where CIDs need to be traversable.
+pub const DAG_CBOR: u64 = 0x71;
+/// RAW should be used for raw data.
+pub const IPLD_RAW: u64 = 0x55;
 
 // TODO: these really don't work all that well in a shared context like this as anyone importing
 // them also need to _explicitly_ import the serde_tuple & serde_repr crates. These are _macros_,

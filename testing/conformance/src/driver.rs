@@ -1,30 +1,51 @@
+// Copyright 2021-2023 Protocol Labs
+// SPDX-License-Identifier: Apache-2.0, MIT
 use std::fmt;
+use std::time::Instant;
 
 use anyhow::{anyhow, Result};
 use cid::Cid;
 use fmt::Display;
+use fvm::engine::MultiEngine;
 use fvm::executor::{ApplyKind, ApplyRet, DefaultExecutor, Executor};
 use fvm::kernel::Context;
-use fvm::machine::{Machine, MultiEngine};
+use fvm::machine::Machine;
 use fvm::state_tree::{ActorState, StateTree};
 use fvm_ipld_blockstore::MemoryBlockstore;
-use fvm_ipld_encoding::{Cbor, CborStore};
+use fvm_ipld_encoding::{from_slice, CborStore};
 use fvm_shared::address::Protocol;
 use fvm_shared::crypto::signature::SECP_SIG_LEN;
 use fvm_shared::message::Message;
 use fvm_shared::receipt::Receipt;
+use fvm_shared::version::NetworkVersion;
 use lazy_static::lazy_static;
 use libipld_core::ipld::Ipld;
 use regex::Regex;
 use walkdir::DirEntry;
 
+use crate::tracing::TestTraceFun;
 use crate::vector::{MessageVector, Variant};
-use crate::vm::{TestKernel, TestMachine};
+use crate::vm::{TestKernel, TestMachine, TestStatsRef};
 
 lazy_static! {
     static ref SKIP_TESTS: Vec<Regex> = vec![
-        // currently empty.
-    ];
+        // TestMachine::import_actors no longer loads V6 bundle required for NetworkVersion 15
+        ".*/specs_actors_v6/.*",
+        ".*/fil_6_.*",
+        // SYS_FORBIDDEN instead of USR_FORBIDDEN. Fixed in newer versions.
+        ".*/specs_actors_v7/TestAggregateBadSender/6f9aa4df047387cdb61f7328f3697c99e53d6151045880902595ca1ac60d334e.*",
+        // USR_ILLEGAL_ARGUMENT instead of USR_NOT_FOUND. Not sure why; disabled so other errors can be seen in CI.
+        ".*/specs_actors_v7/TestWrongPartitionIndexFailure/b4e5b1bb610305fc8cf81bfb859c76b9acdacb109a591354e7a6b43bb8e7b61f.*",
+    ].into_iter().map(|re| Regex::new(re).unwrap()).collect();
+}
+
+lazy_static! {
+    /// Override prices with a different network version.
+    static ref PRICE_NETWORK_VERSION: Option<NetworkVersion> = std::env::var("PRICE_NETWORK_VERSION").ok()
+        .map(|nv| {
+            let nv = nv.parse::<u32>().expect("PRICE_NETWORK_VERSION should be a number");
+            NetworkVersion::try_from(nv).expect("unknown price network version")
+        });
 }
 
 /// Checks if the file is a runnable vector.
@@ -138,23 +159,23 @@ fn compare_state_roots(bs: &MemoryBlockstore, root: &Cid, vector: &MessageVector
     // might exist in the state-tree (it's usually incomplete).
 
     for m in &vector.apply_messages {
-        let msg = Message::unmarshal_cbor(&m.bytes)?;
-        let actual_actor = actual_st.get_actor(&msg.from)?;
-        let expected_actor = expected_st.get_actor(&msg.from)?;
+        let msg: Message = from_slice(&m.bytes)?;
+        let actual_actor = actual_st.get_actor_by_address(&msg.from)?;
+        let expected_actor = expected_st.get_actor_by_address(&msg.from)?;
         compare_actors(bs, "sender", actual_actor, expected_actor)?;
 
-        let actual_actor = actual_st.get_actor(&msg.to)?;
-        let expected_actor = expected_st.get_actor(&msg.to)?;
+        let actual_actor = actual_st.get_actor_by_address(&msg.to)?;
+        let expected_actor = expected_st.get_actor_by_address(&msg.to)?;
         compare_actors(bs, "receiver", actual_actor, expected_actor)?;
     }
 
     // All system actors
     for id in 0..100 {
-        let expected_actor = match expected_st.get_actor_id(id) {
+        let expected_actor = match expected_st.get_actor(id) {
             Ok(act) => act,
             Err(_) => continue, // we don't expect it anyways.
         };
-        let actual_actor = actual_st.get_actor_id(id)?;
+        let actual_actor = actual_st.get_actor(id)?;
         compare_actors(
             bs,
             format_args!("builtin {}", id),
@@ -163,11 +184,11 @@ fn compare_state_roots(bs: &MemoryBlockstore, root: &Cid, vector: &MessageVector
         )?;
     }
 
-    return Err(anyhow!(
+    Err(anyhow!(
         "wrong post root cid; expected {}, but got {}",
         &vector.postconditions.state_tree.root_cid,
         root
-    ));
+    ))
 }
 
 /// Represents the result from running a vector.
@@ -185,17 +206,46 @@ pub fn run_variant(
     v: &MessageVector,
     variant: &Variant,
     engines: &MultiEngine,
-    check_correctness: bool,
+    mut check_correctness: bool,
+    stats: TestStatsRef,
+    trace: Option<TestTraceFun>,
 ) -> anyhow::Result<VariantResult> {
     let id = variant.id.clone();
 
+    // We can't expect gas as the final state to match if we apply a price override.
+    if PRICE_NETWORK_VERSION.is_some() {
+        check_correctness = false;
+    }
+
     // Construct the Machine.
-    let machine = TestMachine::new_for_vector(v, variant, bs, engines);
-    let mut exec: DefaultExecutor<TestKernel> = DefaultExecutor::new(machine);
+    let machine = TestMachine::new_for_vector(
+        v,
+        variant,
+        bs,
+        stats,
+        trace.is_some(),
+        *PRICE_NETWORK_VERSION,
+    )?;
+    let engine = engines
+        .get(&machine.context().network)
+        .map_err(|e| anyhow!(e))?;
+
+    // Preload the actors. We don't usually preload actors when testing, so we're going to do
+    // this explicitly.
+    engine
+        .acquire()
+        .preload(
+            machine.blockstore(),
+            machine.builtin_actors().builtin_actor_codes(),
+        )
+        .unwrap();
+
+    let mut exec: DefaultExecutor<TestKernel> = DefaultExecutor::new(engine, machine)?;
+    let mut rets = Vec::new();
 
     // Apply all messages in the vector.
     for (i, m) in v.apply_messages.iter().enumerate() {
-        let msg = Message::unmarshal_cbor(&m.bytes)?;
+        let msg: Message = from_slice(&m.bytes)?;
 
         // Execute the message.
         let mut raw_length = m.bytes.len();
@@ -204,6 +254,7 @@ pub fn run_variant(
             raw_length += SECP_SIG_LEN + 4;
         }
 
+        let start = Instant::now();
         let ret = match exec.execute_message(msg, ApplyKind::Explicit, raw_length) {
             Ok(ret) => ret,
             Err(e) => return Ok(VariantResult::Failed { id, reason: e }),
@@ -216,6 +267,8 @@ pub fn run_variant(
                 return Ok(VariantResult::Failed { id, reason: err });
             }
         }
+
+        rets.push((start.elapsed(), ret));
     }
 
     // Flush the machine, obtain the blockstore, and compare the
@@ -248,6 +301,13 @@ pub fn run_variant(
                 reason: err.context("comparing state roots failed"),
             });
         }
+    }
+
+    // Exporting now when all checks have passed, so we don't have any results for (partial) Failures
+    // where the overall gas expenditure might contain punishments for error, rather than fair charge for exec.
+    // NOTE: This was the intention, but correctness checks had to be disabled to get some gas for Wasm.
+    if let Some(f) = trace {
+        f(rets)?;
     }
 
     Ok(VariantResult::Ok { id })

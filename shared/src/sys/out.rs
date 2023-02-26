@@ -1,3 +1,5 @@
+// Copyright 2021-2023 Protocol Labs
+// SPDX-License-Identifier: Apache-2.0, MIT
 //! This module contains syscall output data carrier structs, shared between
 //! the FVM SDK and the FVM itself, wrapping multi-value returns.
 //!
@@ -57,24 +59,69 @@ pub mod crypto {
 }
 
 pub mod vm {
-    use crate::clock::ChainEpoch;
+    use bitflags::bitflags;
+
     use crate::sys::TokenAmount;
     use crate::{ActorID, MethodNum};
 
+    bitflags! {
+        /// Invocation flags pertaining to the currently executing actor.
+        #[derive(Default)]
+        #[repr(transparent)]
+        pub struct ContextFlags: u64 {
+            /// Invocation is in "read-only" mode. Any balance transfers, sends that would create
+            /// actors, and calls to `sself::set_root` and `sself::self_destruct` will be rejected.
+            const READ_ONLY = 0b00000001;
+        }
+    }
+
+    impl ContextFlags {
+        pub fn read_only(self) -> bool {
+            self.intersects(Self::READ_ONLY)
+        }
+    }
+
     #[derive(Debug, Copy, Clone)]
     #[repr(packed, C)]
-    pub struct InvocationContext {
-        /// The value that was received.
-        pub value_received: TokenAmount,
+    pub struct MessageContext {
+        /// The current call's origin actor ID.
+        pub origin: ActorID,
+        /// The nonce from the explicit message.
+        pub nonce: u64,
         /// The caller's actor ID.
         pub caller: ActorID,
         /// The receiver's actor ID (i.e. ourselves).
         pub receiver: ActorID,
         /// The method number from the message.
         pub method_number: MethodNum,
+        /// The value that was received.
+        pub value_received: TokenAmount,
+        /// The gas premium being paid by the currently executing message (on top of the base-fee).
+        /// This may be less than the premium specified in the message if the base fee plus the
+        /// premium would exceed the fee cap.
+        pub gas_premium: TokenAmount,
+        /// Flags pertaining to the currently executing actor's invocation context.
+        pub flags: ContextFlags,
+    }
+}
+
+pub mod network {
+    use crate::clock::ChainEpoch;
+    use crate::sys::TokenAmount;
+    use crate::version::NetworkVersion;
+
+    #[derive(Debug, Copy, Clone)]
+    #[repr(packed, C)]
+    pub struct NetworkContext {
         /// The current epoch.
-        pub network_curr_epoch: ChainEpoch,
+        pub epoch: ChainEpoch,
+        /// The current time (seconds since the unix epoch).
+        pub timestamp: u64,
+        /// The current base-fee.
+        pub base_fee: TokenAmount,
+        /// The Chain ID of the network.
+        pub chain_id: u64,
         /// The network version.
-        pub network_version: u32,
+        pub network_version: NetworkVersion,
     }
 }

@@ -1,4 +1,6 @@
-use fvm_ipld_encoding::RawBytes;
+// Copyright 2021-2023 Protocol Labs
+// SPDX-License-Identifier: Apache-2.0, MIT
+use fvm_ipld_encoding::ipld_block::IpldBlock;
 use fvm_shared::address::Address;
 use fvm_shared::econ::TokenAmount;
 use fvm_shared::error::ExitCode;
@@ -21,10 +23,9 @@ pub enum ExecutionEvent {
         from: ActorID,
         to: Address,
         method: MethodNum,
-        params: RawBytes,
+        params: Option<IpldBlock>,
         value: TokenAmount,
     },
-    CallReturn(RawBytes),
-    CallAbort(ExitCode),
+    CallReturn(ExitCode, Option<IpldBlock>),
     CallError(SyscallError),
 }

@@ -1,8 +1,9 @@
+// Copyright 2021-2023 Protocol Labs
 // Copyright 2019-2022 ChainSafe Systems
 // SPDX-License-Identifier: Apache-2.0, MIT
 
 use cid::Cid;
-use fvm_ipld_encoding::Cbor;
+use fvm_ipld_encoding::strict_bytes;
 use serde_tuple::*;
 
 use super::*;
@@ -25,7 +26,7 @@ pub struct SectorInfo {
 #[derive(Debug, PartialEq, Clone, Eq, Serialize_tuple, Deserialize_tuple)]
 pub struct PoStProof {
     pub post_proof: RegisteredPoStProof,
-    #[serde(with = "serde_bytes")]
+    #[serde(with = "strict_bytes")]
     pub proof_bytes: Vec<u8>,
 }
 
@@ -54,9 +55,3 @@ pub struct WindowPoStVerifyInfo {
 pub struct OnChainWindowPoStVerifyInfo {
     pub proofs: Vec<PoStProof>,
 }
-
-impl Cbor for WindowPoStVerifyInfo {}
-
-impl Cbor for PoStProof {}
-
-impl Cbor for SectorInfo {}

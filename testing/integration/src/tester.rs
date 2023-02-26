@@ -1,27 +1,34 @@
+// Copyright 2021-2023 Protocol Labs
+// SPDX-License-Identifier: Apache-2.0, MIT
 use anyhow::{anyhow, Context, Result};
 use cid::Cid;
 use fvm::call_manager::DefaultCallManager;
+use fvm::engine::EnginePool;
 use fvm::executor::DefaultExecutor;
 use fvm::externs::Externs;
-use fvm::machine::{DefaultMachine, Engine, Machine, NetworkConfig};
+use fvm::machine::{DefaultMachine, Machine, MachineContext, NetworkConfig};
 use fvm::state_tree::{ActorState, StateTree};
 use fvm::{init_actor, system_actor, DefaultKernel};
-use fvm_ipld_blockstore::{Block, Blockstore};
+use fvm_ipld_blockstore::{Block, Blockstore, MemoryBlockstore};
 use fvm_ipld_encoding::{ser, CborStore};
-use fvm_shared::address::Address;
+use fvm_shared::address::{Address, Protocol};
 use fvm_shared::econ::TokenAmount;
 use fvm_shared::state::StateTreeVersion;
 use fvm_shared::version::NetworkVersion;
 use fvm_shared::{ActorID, IPLD_RAW};
+use lazy_static::lazy_static;
 use libsecp256k1::{PublicKey, SecretKey};
 use multihash::Code;
 
-use crate::builtin::{
-    fetch_builtin_code_cid, import_builtin_actors, set_init_actor, set_sys_actor,
-};
-use crate::error::Error::{FailedToFlushTree, NoManifestInformation, NoRootCid};
+use crate::builtin::{fetch_builtin_code_cid, set_eam_actor, set_init_actor, set_sys_actor};
+use crate::dummy::DummyExterns;
+use crate::error::Error::{FailedToFlushTree, NoManifestInformation};
 
 const DEFAULT_BASE_FEE: u64 = 100;
+
+lazy_static! {
+    pub static ref INITIAL_ACCOUNT_BALANCE: TokenAmount = TokenAmount::from_atto(10000);
+}
 
 pub trait Store: Blockstore + Sized + 'static {}
 
@@ -30,6 +37,17 @@ pub type IntegrationExecutor<B, E> =
 
 pub type Account = (ActorID, Address);
 
+/// Execution options
+#[derive(Clone, Debug, Default)]
+pub struct ExecutionOptions {
+    /// Enables debug logging
+    pub debug: bool,
+    /// Enables gas tracing
+    pub trace: bool,
+    /// Enabls events
+    pub events: bool,
+}
+
 pub struct Tester<B: Blockstore + 'static, E: Externs + 'static> {
     // Network version used in the test
     nv: NetworkVersion,
@@ -37,12 +55,20 @@ pub struct Tester<B: Blockstore + 'static, E: Externs + 'static> {
     builtin_actors: Cid,
     // Accounts actor cid
     accounts_code_cid: Cid,
+    // Placeholder code cid.
+    placeholder_code_cid: Cid,
     // Custom code cid deployed by developer
     code_cids: Vec<Cid>,
     // Executor used to interact with deployed actors.
     pub executor: Option<IntegrationExecutor<B, E>>,
     // State tree constructed before instantiating the Machine
     pub state_tree: Option<StateTree<B>>,
+
+    // execution options for machine instantiation
+    pub options: Option<ExecutionOptions>,
+
+    // ready if the machine has been instantiated
+    pub ready: bool,
 }
 
 impl<B, E> Tester<B, E>
@@ -50,13 +76,12 @@ where
     B: Blockstore,
     E: Externs,
 {
-    pub fn new(nv: NetworkVersion, stv: StateTreeVersion, blockstore: B) -> Result<Self> {
-        // Load the builtin actors bundles into the blockstore.
-        let nv_actors = import_builtin_actors(&blockstore)?;
-
-        // Get the builtin actors index for the concrete network version.
-        let builtin_actors = *nv_actors.get(&nv).ok_or(NoRootCid(nv))?;
-
+    pub fn new(
+        nv: NetworkVersion,
+        stv: StateTreeVersion,
+        builtin_actors: Cid,
+        blockstore: B,
+    ) -> Result<Self> {
         let (manifest_version, manifest_data_cid): (u32, Cid) =
             match blockstore.get_cbor(&builtin_actors)? {
                 Some((manifest_version, manifest_data)) => (manifest_version, manifest_data),
@@ -64,17 +89,18 @@ where
             };
 
         // Get sys and init actors code cid
-        let (sys_code_cid, init_code_cid, accounts_code_cid) =
+        let (sys_code_cid, init_code_cid, accounts_code_cid, placeholder_code_cid, eam_code_cid) =
             fetch_builtin_code_cid(&blockstore, &manifest_data_cid, manifest_version)?;
 
         // Initialize state tree
         let init_state = init_actor::State::new_test(&blockstore);
         let mut state_tree = StateTree::new(blockstore, stv).map_err(anyhow::Error::from)?;
 
-        // Deploy init and sys actors
+        // Deploy init, sys, and eam actors
         let sys_state = system_actor::State { builtin_actors };
         set_sys_actor(&mut state_tree, sys_state, sys_code_cid)?;
         set_init_actor(&mut state_tree, init_code_cid, init_state)?;
+        set_eam_actor(&mut state_tree, eam_code_cid)?;
 
         Ok(Tester {
             nv,
@@ -83,6 +109,9 @@ where
             code_cids: vec![],
             state_tree: Some(state_tree),
             accounts_code_cid,
+            placeholder_code_cid,
+            options: None,
+            ready: false,
         })
     }
 
@@ -96,12 +125,59 @@ where
         let mut ret: [Account; N] = [(0, Address::default()); N];
         for account in ret.iter_mut().take(N) {
             let priv_key = SecretKey::random(rng);
-            *account = self.make_secp256k1_account(
-                priv_key,
-                TokenAmount::from(10u8) * TokenAmount::from(1000),
-            )?;
+            *account = self.make_secp256k1_account(priv_key, INITIAL_ACCOUNT_BALANCE.clone())?;
         }
         Ok(ret)
+    }
+
+    pub fn create_account(&mut self) -> Result<Account> {
+        let accounts: [Account; 1] = self.create_accounts()?;
+        Ok(accounts[0])
+    }
+
+    pub fn set_account_sequence(&mut self, id: ActorID, new_sequence: u64) -> anyhow::Result<()> {
+        let state_tree = self
+            .state_tree
+            .as_mut()
+            .ok_or_else(|| anyhow!("Expected state tree in set_account_sequence."))?;
+
+        let mut state = state_tree
+            .get_actor(id)?
+            .ok_or_else(|| anyhow!("Can't set sequence of account that doesn't exist."))?;
+
+        state.sequence = new_sequence;
+
+        state_tree.set_actor(id, state);
+        Ok(())
+    }
+
+    pub fn create_placeholder(
+        &mut self,
+        address: &Address,
+        init_balance: TokenAmount,
+    ) -> Result<()> {
+        assert_eq!(address.protocol(), Protocol::Delegated);
+
+        let state_tree = self
+            .state_tree
+            .as_mut()
+            .ok_or_else(|| anyhow!("unable get state tree"))?;
+
+        let id = state_tree.register_new_address(address).unwrap();
+        let state: [u8; 32] = [0; 32];
+
+        let cid = state_tree.store().put_cbor(&state, Code::Blake2b256)?;
+
+        let actor_state = ActorState {
+            code: self.placeholder_code_cid,
+            state: cid,
+            sequence: 0,
+            balance: init_balance,
+            delegated_address: Some(*address),
+        };
+
+        state_tree.set_actor(id, actor_state);
+        Ok(())
     }
 
     /// Set a new state in the state tree
@@ -126,12 +202,16 @@ where
         actor_address: Address,
         balance: TokenAmount,
     ) -> Result<Cid> {
-        // Register actor address
-        self.state_tree
-            .as_mut()
-            .unwrap()
-            .register_new_address(&actor_address)
-            .unwrap();
+        // Register actor address (unless it's an ID address)
+        let actor_id = match actor_address.id() {
+            Ok(id) => id,
+            Err(_) => self
+                .state_tree
+                .as_mut()
+                .unwrap()
+                .register_new_address(&actor_address)
+                .unwrap(),
+        };
 
         // Put the WASM code into the blockstore.
         let code_cid = put_wasm_code(self.state_tree.as_mut().unwrap().store(), wasm_bin)?;
@@ -140,20 +220,48 @@ where
         self.code_cids.push(code_cid);
 
         // Initialize actor state
-        let actor_state = ActorState::new(code_cid, state_cid, balance, 1);
+        let actor_state = ActorState::new(
+            code_cid,
+            state_cid,
+            balance,
+            1,
+            match actor_address.protocol() {
+                Protocol::ID | Protocol::Actor => None,
+                _ => Some(actor_address),
+            },
+        );
 
         // Create actor
         self.state_tree
             .as_mut()
             .unwrap()
-            .set_actor(&actor_address, actor_state)
-            .map_err(anyhow::Error::from)?;
+            .set_actor(actor_id, actor_state);
 
         Ok(code_cid)
     }
 
     /// Sets the Machine and the Executor in our Tester structure.
     pub fn instantiate_machine(&mut self, externs: E) -> Result<()> {
+        self.instantiate_machine_with_config(externs, |_| (), |_| ())?;
+        self.ready = true;
+        Ok(())
+    }
+
+    /// Sets the Machine and the Executor in our Tester structure.
+    ///
+    /// The `configure_nc` and `configure_mc` functions allows the caller to adjust the
+    /// `NetworkConfiguration` and `MachineContext` before they are used to instantiate
+    /// the rest of the components.
+    pub fn instantiate_machine_with_config<F, G>(
+        &mut self,
+        externs: E,
+        configure_nc: F,
+        configure_mc: G,
+    ) -> Result<()>
+    where
+        F: FnOnce(&mut NetworkConfig),
+        G: FnOnce(&mut MachineContext),
+    {
         // Take the state tree and leave None behind.
         let mut state_tree = self.state_tree.take().unwrap();
 
@@ -167,29 +275,31 @@ where
         let blockstore = state_tree.into_store();
 
         let mut nc = NetworkConfig::new(self.nv);
-        nc.actor_debugging = true;
         nc.override_actors(self.builtin_actors);
         nc.enable_actor_debugging();
 
-        let mut mc = nc.for_epoch(0, state_root);
-        mc.set_base_fee(TokenAmount::from(DEFAULT_BASE_FEE));
+        // Custom configuration.
+        configure_nc(&mut nc);
 
-        let machine = DefaultMachine::new(
-            &Engine::new_default((&mc.network.clone()).into())?,
-            &mc,
-            blockstore,
-            externs,
-        )?;
+        let mut mc = nc.for_epoch(0, 0, state_root);
+        mc.set_base_fee(TokenAmount::from_atto(DEFAULT_BASE_FEE))
+            .enable_tracing();
+
+        // Custom configuration.
+        configure_mc(&mut mc);
+
+        let engine = EnginePool::new_default((&mc.network.clone()).into())?;
+        engine.acquire().preload(&blockstore, &self.code_cids)?;
+
+        let machine = DefaultMachine::new(&mc, blockstore, externs)?;
 
         let executor =
             DefaultExecutor::<DefaultKernel<DefaultCallManager<DefaultMachine<B, E>>>>::new(
-                machine,
-            );
-        executor
-            .engine()
-            .preload(executor.blockstore(), &self.code_cids)?;
+                engine, machine,
+            )?;
 
         self.executor = Some(executor);
+        self.ready = true;
 
         Ok(())
     }
@@ -228,14 +338,87 @@ where
             state: cid,
             sequence: 0,
             balance: init_balance,
+            delegated_address: None,
         };
 
-        state_tree
-            .set_actor(&Address::new_id(assigned_addr), actor_state)
-            .map_err(anyhow::Error::from)?;
+        state_tree.set_actor(assigned_addr, actor_state);
         Ok((assigned_addr, pub_key_addr))
     }
 }
+
+pub type BasicTester = Tester<MemoryBlockstore, DummyExterns>;
+pub type BasicExecutor = IntegrationExecutor<MemoryBlockstore, DummyExterns>;
+
+// TODO refactor base Account type to include the seqno;
+// requires refactoring all over the place hpwever.
+pub struct BasicAccount {
+    pub account: Account,
+    pub seqno: u64,
+}
+
+impl BasicTester {
+    pub fn new_basic_tester(bundle_path: String, options: ExecutionOptions) -> Result<BasicTester> {
+        let blockstore = MemoryBlockstore::default();
+        let bundle_cid =
+            match crate::bundle::import_bundle_from_path(&blockstore, bundle_path.as_str()) {
+                Ok(cid) => cid,
+                Err(what) => return Err(what),
+            };
+
+        let mut tester = Tester::new(
+            NetworkVersion::V18,
+            StateTreeVersion::V5,
+            bundle_cid,
+            blockstore,
+        )?;
+
+        tester.options = Some(options);
+        tester.ready = false;
+
+        Ok(tester)
+    }
+
+    pub fn create_basic_account(&mut self) -> Result<BasicAccount> {
+        let accounts: [Account; 1] = self.create_accounts()?;
+        Ok(BasicAccount {
+            account: accounts[0],
+            seqno: 0,
+        })
+    }
+
+    pub fn create_basic_accounts<const N: usize>(&mut self) -> Result<[BasicAccount; N]> {
+        let accounts: [Account; N] = self.create_accounts()?;
+        Ok(accounts.map(|a| BasicAccount {
+            account: a,
+            seqno: 0,
+        }))
+    }
+
+    pub fn with_executor<F, T>(&mut self, f: F) -> Result<T>
+    where
+        F: FnOnce(&mut BasicExecutor) -> Result<T>,
+    {
+        self.prepare_execution()?;
+        f(self.executor.as_mut().unwrap())
+    }
+
+    fn prepare_execution(&mut self) -> Result<()> {
+        if !self.ready {
+            if let Some(options) = self.options.clone() {
+                self.instantiate_machine_with_config(
+                    DummyExterns,
+                    |cfg| cfg.actor_debugging = options.debug,
+                    |mc| mc.tracing = options.trace,
+                )?;
+            } else {
+                self.instantiate_machine(DummyExterns)?;
+            }
+            self.ready = true
+        }
+        Ok(())
+    }
+}
+
 /// Inserts the WASM code for the actor into the blockstore.
 fn put_wasm_code(blockstore: &impl Blockstore, wasm_binary: &[u8]) -> Result<Cid> {
     let cid = blockstore.put(

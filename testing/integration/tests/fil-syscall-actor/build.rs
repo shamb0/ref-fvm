@@ -1,5 +1,7 @@
+// Copyright 2021-2023 Protocol Labs
+// SPDX-License-Identifier: Apache-2.0, MIT
 fn main() {
-    use wasm_builder::WasmBuilder;
+    use substrate_wasm_builder::WasmBuilder;
     WasmBuilder::new()
         .with_current_project()
         .import_memory()

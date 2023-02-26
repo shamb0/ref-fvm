@@ -1,9 +1,10 @@
+// Copyright 2021-2023 Protocol Labs
 // Copyright 2019-2022 ChainSafe Systems
 // SPDX-License-Identifier: Apache-2.0, MIT
 
 use std::convert::TryFrom;
 
-use fvm_ipld_encoding::serde_bytes;
+use fvm_ipld_encoding::strict_bytes;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::BitField;
@@ -36,7 +37,7 @@ impl<'a> Validate<'a> for &'a BitField {
 #[serde(untagged)]
 pub enum UnvalidatedBitField {
     Validated(BitField),
-    Unvalidated(#[serde(with = "serde_bytes")] Vec<u8>),
+    Unvalidated(#[serde(with = "strict_bytes")] Vec<u8>),
 }
 
 impl UnvalidatedBitField {
@@ -94,7 +95,7 @@ impl<'de> Deserialize<'de> for UnvalidatedBitField {
     where
         D: Deserializer<'de>,
     {
-        let bytes: Vec<u8> = serde_bytes::deserialize(deserializer)?;
+        let bytes: Vec<u8> = strict_bytes::deserialize(deserializer)?;
         if bytes.len() > MAX_ENCODED_SIZE {
             return Err(serde::de::Error::custom(format!(
                 "encoded bitfield was too large {}",

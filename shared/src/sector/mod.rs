@@ -1,3 +1,4 @@
+// Copyright 2021-2023 Protocol Labs
 // Copyright 2019-2022 ChainSafe Systems
 // SPDX-License-Identifier: Apache-2.0, MIT
 
@@ -34,7 +35,7 @@ pub type Spacetime = BigInt;
 pub type SectorQuality = BigInt;
 
 /// SectorSize indicates one of a set of possible sizes in the network.
-#[derive(Clone, Debug, PartialEq, Copy, FromPrimitive, Serialize_repr, Deserialize_repr)]
+#[derive(Clone, Debug, PartialEq, Eq, Copy, FromPrimitive, Serialize_repr, Deserialize_repr)]
 #[repr(u64)]
 pub enum SectorSize {
     _2KiB = 2 << 10,
@@ -51,7 +52,7 @@ impl fmt::Display for SectorSize {
 }
 
 /// Sector ID which contains the sector number and the actor ID for the miner.
-#[derive(Clone, Debug, Default, PartialEq, Serialize_tuple, Deserialize_tuple)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize_tuple, Deserialize_tuple)]
 pub struct SectorID {
     pub miner: ActorID,
     pub number: SectorNumber,

@@ -1,13 +1,13 @@
+// Copyright 2021-2023 Protocol Labs
 // Copyright 2019-2022 ChainSafe Systems
 // SPDX-License-Identifier: Apache-2.0, MIT
 
 use anyhow::anyhow;
 use fvm_ipld_encoding::de::{Deserialize, Deserializer};
 use fvm_ipld_encoding::ser::{Serialize, Serializer};
-use fvm_ipld_encoding::{Cbor, RawBytes};
+use fvm_ipld_encoding::RawBytes;
 
 use crate::address::Address;
-use crate::bigint::bigint_ser::{BigIntDe, BigIntSer};
 use crate::econ::TokenAmount;
 use crate::MethodNum;
 
@@ -15,35 +15,27 @@ use crate::MethodNum;
 #[cfg_attr(feature = "testing", derive(Default))]
 #[derive(PartialEq, Clone, Debug, Hash, Eq)]
 pub struct Message {
-    pub version: i64,
+    pub version: u64,
     pub from: Address,
     pub to: Address,
     pub sequence: u64,
     pub value: TokenAmount,
     pub method_num: MethodNum,
     pub params: RawBytes,
-    pub gas_limit: i64,
+    pub gas_limit: u64,
     pub gas_fee_cap: TokenAmount,
     pub gas_premium: TokenAmount,
 }
 
-impl Cbor for Message {}
-
 impl Message {
-    /// Helper function to convert the message into signing bytes.
-    /// This function returns the message `Cid` bytes.
-    pub fn to_signing_bytes(&self) -> Vec<u8> {
-        // Safe to unwrap here, unsigned message cannot fail to serialize.
-        self.cid().unwrap().to_bytes()
-    }
-
     /// Does some basic checks on the Message to see if the fields are valid.
     pub fn check(self: &Message) -> anyhow::Result<()> {
         if self.gas_limit == 0 {
             return Err(anyhow!("Message has no gas limit set"));
         }
-        if self.gas_limit < 0 {
-            return Err(anyhow!("Message has negative gas limit"));
+        // TODO: max block limit?
+        if self.gas_limit > i64::MAX as u64 {
+            return Err(anyhow!("Message gas exceeds i64 max"));
         }
         Ok(())
     }
@@ -59,10 +51,10 @@ impl Serialize for Message {
             &self.to,
             &self.from,
             &self.sequence,
-            BigIntSer(&self.value),
+            &self.value,
             &self.gas_limit,
-            BigIntSer(&self.gas_fee_cap),
-            BigIntSer(&self.gas_premium),
+            &self.gas_fee_cap,
+            &self.gas_premium,
             &self.method_num,
             &self.params,
         )
@@ -80,10 +72,10 @@ impl<'de> Deserialize<'de> for Message {
             to,
             from,
             sequence,
-            BigIntDe(value),
+            value,
             gas_limit,
-            BigIntDe(gas_fee_cap),
-            BigIntDe(gas_premium),
+            gas_fee_cap,
+            gas_premium,
             method_num,
             params,
         ) = Deserialize::deserialize(deserializer)?;
@@ -99,5 +91,23 @@ impl<'de> Deserialize<'de> for Message {
             gas_fee_cap,
             gas_premium,
         })
+    }
+}
+
+#[cfg(feature = "arb")]
+impl quickcheck::Arbitrary for Message {
+    fn arbitrary(g: &mut quickcheck::Gen) -> Self {
+        Self {
+            to: Address::arbitrary(g),
+            from: Address::arbitrary(g),
+            version: u64::arbitrary(g),
+            sequence: u64::arbitrary(g),
+            value: TokenAmount::arbitrary(g),
+            method_num: u64::arbitrary(g),
+            params: fvm_ipld_encoding::RawBytes::new(Vec::arbitrary(g)),
+            gas_limit: u64::arbitrary(g),
+            gas_fee_cap: TokenAmount::arbitrary(g),
+            gas_premium: TokenAmount::arbitrary(g),
+        }
     }
 }

@@ -1,5 +1,10 @@
+// Copyright 2021-2023 Protocol Labs
+// SPDX-License-Identifier: Apache-2.0, MIT
 //! This module contains types exchanged at the syscall layer between actors
 //! (usually through the SDK) and the FVM.
+
+use bitflags::bitflags;
+use num_bigint::TryFromBigIntError;
 
 pub mod out;
 
@@ -20,14 +25,14 @@ pub struct TokenAmount {
 
 impl From<TokenAmount> for crate::econ::TokenAmount {
     fn from(v: TokenAmount) -> Self {
-        crate::econ::TokenAmount::from(v.hi) << 64 | crate::econ::TokenAmount::from(v.lo)
+        crate::econ::TokenAmount::from_atto((v.hi as u128) << 64 | (v.lo as u128))
     }
 }
 
 impl TryFrom<crate::econ::TokenAmount> for TokenAmount {
-    type Error = <crate::econ::TokenAmount as TryInto<u128>>::Error;
+    type Error = TryFromBigIntError<()>;
     fn try_from(v: crate::econ::TokenAmount) -> Result<Self, Self::Error> {
-        v.try_into().map(|v: u128| Self {
+        v.atto().try_into().map(|v: u128| Self {
             hi: (v >> u64::BITS) as u64,
             lo: v as u64,
         })
@@ -35,12 +40,30 @@ impl TryFrom<crate::econ::TokenAmount> for TokenAmount {
 }
 
 impl<'a> TryFrom<&'a crate::econ::TokenAmount> for TokenAmount {
-    type Error = <&'a crate::econ::TokenAmount as TryInto<u128>>::Error;
+    type Error = TryFromBigIntError<()>;
     fn try_from(v: &'a crate::econ::TokenAmount) -> Result<Self, Self::Error> {
-        v.try_into().map(|v: u128| Self {
+        v.atto().try_into().map(|v: u128| Self {
             hi: (v >> u64::BITS) as u64,
             lo: v as u64,
         })
+    }
+}
+
+bitflags! {
+    /// Flags passed to the send syscall.
+    #[derive(Default)]
+    #[repr(transparent)]
+    // note: this is 64 bits because I don't want to hate my past self, not because we need them
+    // right now. It doesn't really cost anything anyways.
+    pub struct SendFlags: u64 {
+        /// Send in "read-only" mode.
+        const READ_ONLY = 0b00000001;
+    }
+}
+
+impl SendFlags {
+    pub fn read_only(self) -> bool {
+        self.intersects(Self::READ_ONLY)
     }
 }
 
@@ -74,7 +97,8 @@ assert_syscall_safe! {
     out::ipld::IpldStat,
     out::send::Send,
     out::crypto::VerifyConsensusFault,
-    out::vm::InvocationContext,
+    out::network::NetworkContext,
+    out::vm::MessageContext,
 }
 
 unsafe impl<T, const N: usize> SyscallSafe for [T; N] where T: SyscallSafe {}

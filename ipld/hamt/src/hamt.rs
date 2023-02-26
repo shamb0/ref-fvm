@@ -1,3 +1,4 @@
+// Copyright 2021-2023 Protocol Labs
 // Copyright 2019-2022 ChainSafe Systems
 // SPDX-License-Identifier: Apache-2.0, MIT
 
@@ -12,8 +13,9 @@ use multihash::Code;
 use serde::de::DeserializeOwned;
 use serde::{Serialize, Serializer};
 
+use crate::hash_bits::HashBits;
 use crate::node::Node;
-use crate::{Error, Hash, HashAlgorithm, Sha256, DEFAULT_BIT_WIDTH};
+use crate::{Config, Error, Hash, HashAlgorithm, Sha256};
 
 /// Implementation of the HAMT data structure for IPLD.
 ///
@@ -35,9 +37,10 @@ use crate::{Error, Hash, HashAlgorithm, Sha256, DEFAULT_BIT_WIDTH};
 pub struct Hamt<BS, V, K = BytesKey, H = Sha256> {
     root: Node<K, V, H>,
     store: BS,
-
-    bit_width: u32,
+    conf: Config,
     hash: PhantomData<H>,
+    /// Remember the last flushed CID until it changes.
+    flushed_cid: Option<Cid>,
 }
 
 impl<BS, V, K, H> Serialize for Hamt<BS, V, K, H>
@@ -68,41 +71,67 @@ where
     H: HashAlgorithm,
 {
     pub fn new(store: BS) -> Self {
-        Self::new_with_bit_width(store, DEFAULT_BIT_WIDTH)
+        Self::new_with_config(store, Config::default())
+    }
+
+    pub fn new_with_config(store: BS, conf: Config) -> Self {
+        Self {
+            root: Node::default(),
+            store,
+            conf,
+            hash: Default::default(),
+            flushed_cid: None,
+        }
     }
 
     /// Construct hamt with a bit width
     pub fn new_with_bit_width(store: BS, bit_width: u32) -> Self {
-        Self {
-            root: Node::default(),
+        Self::new_with_config(
             store,
-            bit_width,
-            hash: Default::default(),
-        }
+            Config {
+                bit_width,
+                ..Default::default()
+            },
+        )
     }
 
     /// Lazily instantiate a hamt from this root Cid.
     pub fn load(cid: &Cid, store: BS) -> Result<Self, Error> {
-        Self::load_with_bit_width(cid, store, DEFAULT_BIT_WIDTH)
+        Self::load_with_config(cid, store, Config::default())
     }
 
-    /// Lazily instantiate a hamt from this root Cid with a specified bit width.
-    pub fn load_with_bit_width(cid: &Cid, store: BS, bit_width: u32) -> Result<Self, Error> {
+    /// Lazily instantiate a hamt from this root Cid with a specified parameters.
+    pub fn load_with_config(cid: &Cid, store: BS, conf: Config) -> Result<Self, Error> {
         match store.get_cbor(cid)? {
             Some(root) => Ok(Self {
                 root,
                 store,
-                bit_width,
+                conf,
                 hash: Default::default(),
+                flushed_cid: Some(*cid),
             }),
             None => Err(Error::CidNotFound(cid.to_string())),
         }
+    }
+    /// Lazily instantiate a hamt from this root Cid with a specified bit width.
+    pub fn load_with_bit_width(cid: &Cid, store: BS, bit_width: u32) -> Result<Self, Error> {
+        Self::load_with_config(
+            cid,
+            store,
+            Config {
+                bit_width,
+                ..Default::default()
+            },
+        )
     }
 
     /// Sets the root based on the Cid of the root node using the Hamt store
     pub fn set_root(&mut self, cid: &Cid) -> Result<(), Error> {
         match self.store.get_cbor(cid)? {
-            Some(root) => self.root = root,
+            Some(root) => {
+                self.root = root;
+                self.flushed_cid = Some(*cid);
+            }
             None => return Err(Error::CidNotFound(cid.to_string())),
         }
 
@@ -140,9 +169,15 @@ where
     where
         V: PartialEq,
     {
-        self.root
-            .set(key, value, self.store.borrow(), self.bit_width, true)
-            .map(|(r, _)| r)
+        let (old, modified) = self
+            .root
+            .set(key, value, self.store.borrow(), &self.conf, true)?;
+
+        if modified {
+            self.flushed_cid = None;
+        }
+
+        Ok(old)
     }
 
     /// Inserts a key-value pair into the HAMT only if that key does not already exist.
@@ -175,9 +210,16 @@ where
     where
         V: PartialEq,
     {
-        self.root
-            .set(key, value, self.store.borrow(), self.bit_width, false)
-            .map(|(_, set)| set)
+        let set = self
+            .root
+            .set(key, value, self.store.borrow(), &self.conf, false)
+            .map(|(_, set)| set)?;
+
+        if set {
+            self.flushed_cid = None;
+        }
+
+        Ok(set)
     }
 
     /// Returns a reference to the value corresponding to the key.
@@ -206,7 +248,7 @@ where
         Q: Hash + Eq,
         V: DeserializeOwned,
     {
-        match self.root.get(k, self.store.borrow(), self.bit_width)? {
+        match self.root.get(k, self.store.borrow(), &self.conf)? {
             Some(v) => Ok(Some(v)),
             None => Ok(None),
         }
@@ -237,10 +279,7 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq,
     {
-        Ok(self
-            .root
-            .get(k, self.store.borrow(), self.bit_width)?
-            .is_some())
+        Ok(self.root.get(k, self.store.borrow(), &self.conf)?.is_some())
     }
 
     /// Removes a key from the HAMT, returning the value at the key if the key
@@ -268,14 +307,24 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq,
     {
-        self.root
-            .remove_entry(k, self.store.borrow(), self.bit_width)
+        let deleted = self.root.remove_entry(k, self.store.borrow(), &self.conf)?;
+
+        if deleted.is_some() {
+            self.flushed_cid = None;
+        }
+
+        Ok(deleted)
     }
 
     /// Flush root and return Cid for hamt
     pub fn flush(&mut self) -> Result<Cid, Error> {
+        if let Some(cid) = self.flushed_cid {
+            return Ok(cid);
+        }
         self.root.flush(self.store.borrow())?;
-        Ok(self.store.put_cbor(&self.root, Code::Blake2b256)?)
+        let cid = self.store.put_cbor(&self.root, Code::Blake2b256)?;
+        self.flushed_cid = Some(cid);
+        Ok(cid)
     }
 
     /// Returns true if the HAMT has no entries
@@ -312,6 +361,74 @@ where
         F: FnMut(&K, &V) -> anyhow::Result<()>,
     {
         self.root.for_each(self.store.borrow(), &mut f)
+    }
+
+    /// Iterates over each KV in the Hamt and runs a function on the values. If starting key is
+    /// provided, iteration will start from that key. If max is provided, iteration will stop after
+    /// max number of items have been traversed. The number of items that were traversed is
+    /// returned. If there are more items in the Hamt after max items have been traversed, the key
+    /// of the next item will be returned.
+    ///
+    /// This function will constrain all values to be of the same type
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use fvm_ipld_hamt::Hamt;
+    ///
+    /// let store = fvm_ipld_blockstore::MemoryBlockstore::default();
+    ///
+    /// let mut map: Hamt<_, _, u64> = Hamt::new(store);
+    /// map.set(1, 1).unwrap();
+    /// map.set(2, 2).unwrap();
+    /// map.set(3, 3).unwrap();
+    /// map.set(4, 4).unwrap();
+    ///
+    /// let mut numbers = vec![];
+    ///
+    /// map.for_each_ranged(None, None, |_, v: &u64| {
+    ///     numbers.push(*v);
+    ///     Ok(())
+    /// }).unwrap();
+    ///
+    /// let mut subset = vec![];
+    ///
+    /// let (_, next_key) = map.for_each_ranged(Some(&numbers[0]), Some(2), |_, v: &u64| {
+    ///     subset.push(*v);
+    ///     Ok(())
+    /// }).unwrap();
+    ///
+    /// assert_eq!(subset, numbers[..2]);
+    /// assert_eq!(next_key.unwrap(), numbers[2]);
+    /// ```
+    #[inline]
+    pub fn for_each_ranged<Q: ?Sized, F>(
+        &self,
+        starting_key: Option<&Q>,
+        max: Option<usize>,
+        mut f: F,
+    ) -> Result<(usize, Option<K>), Error>
+    where
+        K: Borrow<Q> + Clone,
+        Q: Eq + Hash,
+        V: DeserializeOwned,
+        F: FnMut(&K, &V) -> anyhow::Result<()>,
+    {
+        match starting_key {
+            Some(key) => {
+                let hash = H::hash(key);
+                self.root.for_each_ranged(
+                    self.store.borrow(),
+                    &self.conf,
+                    Some((HashBits::new(&hash), key)),
+                    max,
+                    &mut f,
+                )
+            }
+            None => self
+                .root
+                .for_each_ranged(self.store.borrow(), &self.conf, None, max, &mut f),
+        }
     }
 
     /// Consumes this HAMT and returns the Blockstore it owns.

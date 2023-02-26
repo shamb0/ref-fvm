@@ -1,3 +1,4 @@
+// Copyright 2021-2023 Protocol Labs
 // Copyright 2019-2022 ChainSafe Systems
 // SPDX-License-Identifier: Apache-2.0, MIT
 
@@ -6,11 +7,10 @@ extern crate lazy_static;
 
 use address::Address;
 use clock::ChainEpoch;
-use num_bigint::BigInt;
 
-pub mod actor;
 pub mod address;
 pub mod bigint;
+pub mod chainid;
 pub mod clock;
 pub mod commcid;
 pub mod consensus;
@@ -18,6 +18,7 @@ pub mod crypto;
 pub mod deal;
 pub mod econ;
 pub mod error;
+pub mod event;
 pub mod math;
 pub mod message;
 pub mod piece;
@@ -30,9 +31,14 @@ pub mod state;
 pub mod sys;
 pub mod version;
 
+use econ::TokenAmount;
+use fvm_ipld_encoding::ipld_block::IpldBlock;
+
+use crate::error::ExitCode;
+
 lazy_static! {
     /// Total Filecoin available to the network.
-    pub static ref TOTAL_FILECOIN: BigInt = BigInt::from(TOTAL_FILECOIN_BASE) * FILECOIN_PRECISION;
+    pub static ref TOTAL_FILECOIN: TokenAmount = TokenAmount::from_whole(TOTAL_FILECOIN_BASE);
 
     /// Zero address used to avoid allowing it to be used for verification.
     /// This is intentionally disallowed because it is an edge case with Filecoin's BLS
@@ -55,7 +61,7 @@ pub type ActorID = u64;
 /// Default bit width for the hamt in the filecoin protocol.
 pub const HAMT_BIT_WIDTH: u32 = 5;
 /// Total gas limit allowed per block. This is shared across networks.
-pub const BLOCK_GAS_LIMIT: i64 = 10_000_000_000;
+pub const BLOCK_GAS_LIMIT: u64 = 10_000_000_000;
 /// Total Filecoin supply.
 pub const TOTAL_FILECOIN_BASE: i64 = 2_000_000_000;
 
@@ -67,9 +73,6 @@ pub const WINNING_POST_SECTOR_SET_LOOKBACK: ChainEpoch = 10;
 
 /// The expected number of block producers in each epoch.
 pub const BLOCKS_PER_EPOCH: u64 = 5;
-
-/// Ratio of integer values to token value.
-pub const FILECOIN_PRECISION: i64 = 1_000_000_000_000_000_000;
 
 /// Allowable clock drift in validations.
 pub const ALLOWABLE_CLOCK_DRIFT: u64 = 1;
@@ -83,13 +86,8 @@ pub trait NetworkParams {
     const MINING_REWARD_TOTAL: i64;
 
     /// Initial reward actor balance. This function is only called in genesis setting up state.
-    fn initial_reward_balance() -> BigInt {
-        BigInt::from(Self::MINING_REWARD_TOTAL) * Self::TOTAL_FILECOIN
-    }
-
-    /// Convert integer value of tokens into BigInt based on the token precision.
-    fn from_fil(i: i64) -> BigInt {
-        BigInt::from(i) * FILECOIN_PRECISION
+    fn initial_reward_balance() -> TokenAmount {
+        TokenAmount::from_whole(Self::MINING_REWARD_TOTAL)
     }
 }
 
@@ -110,3 +108,10 @@ pub type MethodNum = u64;
 pub const METHOD_SEND: MethodNum = 0;
 /// Base actor constructor method.
 pub const METHOD_CONSTRUCTOR: MethodNum = 1;
+
+/// The outcome of a `Send`, covering its ExitCode and optional return data
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct Response {
+    pub exit_code: ExitCode,
+    pub return_data: Option<IpldBlock>,
+}

@@ -1,47 +1,53 @@
+// Copyright 2021-2023 Protocol Labs
+// SPDX-License-Identifier: Apache-2.0, MIT
 use std::ops::{Deref, DerefMut};
 use std::result::Result as StdResult;
 
 use anyhow::{anyhow, Result};
 use cid::Cid;
-use fvm_ipld_encoding::{RawBytes, DAG_CBOR};
-use fvm_shared::actor::builtin::Type;
-use fvm_shared::address::Address;
-use fvm_shared::bigint::{BigInt, Sign};
+use fvm_ipld_encoding::{RawBytes, CBOR};
+use fvm_shared::address::Payload;
 use fvm_shared::econ::TokenAmount;
 use fvm_shared::error::{ErrorNumber, ExitCode};
+use fvm_shared::event::StampedEvent;
 use fvm_shared::message::Message;
 use fvm_shared::receipt::Receipt;
-use fvm_shared::ActorID;
+use fvm_shared::{ActorID, IPLD_RAW, METHOD_SEND};
 use num_traits::Zero;
 
 use super::{ApplyFailure, ApplyKind, ApplyRet, Executor};
-use crate::call_manager::{backtrace, CallManager, InvocationResult};
+use crate::call_manager::{backtrace, Backtrace, CallManager, InvocationResult};
+use crate::eam_actor::EAM_ACTOR_ID;
+use crate::engine::EnginePool;
 use crate::gas::{Gas, GasCharge, GasOutputs};
 use crate::kernel::{Block, ClassifyResult, Context as _, ExecutionError, Kernel};
-use crate::machine::{Machine, BURNT_FUNDS_ACTOR_ADDR, REWARD_ACTOR_ADDR};
+use crate::machine::{Machine, BURNT_FUNDS_ACTOR_ID, REWARD_ACTOR_ID};
+use crate::trace::ExecutionTrace;
 
 /// The default [`Executor`].
 ///
 /// # Warning
 ///
 /// Message execution might run out of stack and crash (the entire process) if it doesn't have at
-/// least 64MiB of stacks space. If you can't guarantee 64MiB of stack space, wrap this executor in
+/// least 64MiB of stack space. If you can't guarantee 64MiB of stack space, wrap this executor in
 /// a [`ThreadedExecutor`][super::ThreadedExecutor].
-// If the inner value is `None` it means the machine got poisoned and is unusable.
-#[repr(transparent)]
-pub struct DefaultExecutor<K: Kernel>(Option<<K::CallManager as CallManager>::Machine>);
+pub struct DefaultExecutor<K: Kernel> {
+    engine_pool: EnginePool,
+    // If the inner value is `None` it means the machine got poisoned and is unusable.
+    machine: Option<<K::CallManager as CallManager>::Machine>,
+}
 
 impl<K: Kernel> Deref for DefaultExecutor<K> {
     type Target = <K::CallManager as CallManager>::Machine;
 
     fn deref(&self) -> &Self::Target {
-        &*self.0.as_ref().expect("machine poisoned")
+        self.machine.as_ref().expect("machine poisoned")
     }
 }
 
 impl<K: Kernel> DerefMut for DefaultExecutor<K> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut *self.0.as_mut().expect("machine poisoned")
+        &mut *self.machine.as_mut().expect("machine poisoned")
     }
 }
 
@@ -65,71 +71,149 @@ where
                 Err(apply_ret) => return Ok(apply_ret),
             };
 
+        struct MachineExecRet {
+            result: crate::kernel::error::Result<InvocationResult>,
+            gas_used: u64,
+            backtrace: Backtrace,
+            exec_trace: ExecutionTrace,
+            events_root: Option<Cid>,
+            events: Vec<StampedEvent>, // TODO consider removing if nothing in the client ends up using it.
+        }
+
+        // Pre-resolve the message receiver's address, if known.
+        let receiver_id = self
+            .state_tree()
+            .lookup_id(&msg.to)
+            .context("failure when looking up message receiver")?;
+
+        // Filecoin caps the premium plus the base-fee at the fee-cap.
+        // We expose the _effective_ premium to the user.
+        let effective_premium = msg
+            .gas_premium
+            .clone()
+            .min(&msg.gas_fee_cap - &self.context().base_fee)
+            .max(TokenAmount::zero());
+
+        // Acquire an engine from the pool. This may block if there are concurrently executing
+        // messages inside other executors sharing the same pool.
+        let engine = self.engine_pool.acquire();
+
         // Apply the message.
-        let (res, gas_used, mut backtrace, exec_trace) = self.map_machine(|machine| {
-            let mut cm = K::CallManager::new(machine, msg.gas_limit, msg.from, msg.sequence);
+        let ret = self.map_machine(|machine| {
+            // We're processing a chain message, so the sender is the origin of the call stack.
+            let mut cm = K::CallManager::new(
+                machine,
+                engine,
+                msg.gas_limit,
+                sender_id,
+                msg.from,
+                receiver_id,
+                msg.to,
+                msg.sequence,
+                effective_premium,
+            );
             // This error is fatal because it should have already been accounted for inside
             // preflight_message.
             if let Err(e) = cm.charge_gas(inclusion_cost) {
-                return (Err(e), cm.finish().1);
+                let (_, machine) = cm.finish();
+                return (Err(e), machine);
             }
 
-            let params = if msg.params.is_empty() {
-                None
-            } else {
-                Some(Block::new(DAG_CBOR, msg.params.bytes()))
-            };
+            let params = (!msg.params.is_empty()).then(|| {
+                Block::new(
+                    if msg.method_num == METHOD_SEND {
+                        // Method zero params are "arbitrary bytes", so we'll just count them as
+                        // raw.
+                        //
+                        // This won't actually affect anything (because no code will see these
+                        // parameters), but it's more correct and makes me happier.
+                        //
+                        // NOTE: this _may_ start to matter once we start _validating_ ipld (m2.2).
+                        IPLD_RAW
+                    } else {
+                        // This is CBOR, not DAG_CBOR, because links sent from off-chain aren't
+                        // reachable.
+                        CBOR
+                    },
+                    msg.params.bytes(),
+                )
+            });
 
             let result = cm.with_transaction(|cm| {
                 // Invoke the message.
-                let ret = cm.send::<K>(sender_id, msg.to, msg.method_num, params, &msg.value)?;
+                let ret = cm.send::<K>(
+                    sender_id,
+                    msg.to,
+                    msg.method_num,
+                    params,
+                    &msg.value,
+                    None,
+                    false,
+                )?;
 
                 // Charge for including the result (before we end the transaction).
-                if let InvocationResult::Return(value) = &ret {
-                    cm.charge_gas(cm.context().price_list.on_chain_return_value(
-                        value.as_ref().map(|v| v.size() as usize).unwrap_or(0),
-                    ))?;
+                if let Some(value) = &ret.value {
+                    let _ = cm.charge_gas(
+                        cm.context()
+                            .price_list
+                            .on_chain_return_value(value.size() as usize),
+                    )?;
                 }
 
                 Ok(ret)
             });
-            let (res, machine) = cm.finish();
+
+            let (res, machine) = match cm.finish() {
+                (Ok(res), machine) => (res, machine),
+                (Err(err), machine) => return (Err(err), machine),
+            };
+
             (
-                Ok((result, res.gas_used, res.backtrace, res.exec_trace)),
+                Ok(MachineExecRet {
+                    result,
+                    gas_used: res.gas_used,
+                    backtrace: res.backtrace,
+                    exec_trace: res.exec_trace,
+                    events_root: res.events_root,
+                    events: res.events,
+                }),
                 machine,
             )
         })?;
 
+        let MachineExecRet {
+            result: res,
+            gas_used,
+            mut backtrace,
+            exec_trace,
+            events_root,
+            events,
+        } = ret;
+
         // Extract the exit code and build the result of the message application.
         let receipt = match res {
-            Ok(InvocationResult::Return(return_value)) => {
+            Ok(InvocationResult { exit_code, value }) => {
                 // Convert back into a top-level return "value". We throw away the codec here,
                 // unfortunately.
-                let return_data = return_value
+                let return_data = value
                     .map(|blk| RawBytes::from(blk.data().to_vec()))
                     .unwrap_or_default();
 
-                backtrace.clear();
-                Receipt {
-                    exit_code: ExitCode::OK,
-                    return_data,
-                    gas_used,
-                }
-            }
-            Ok(InvocationResult::Failure(exit_code)) => {
                 if exit_code.is_success() {
-                    return Err(anyhow!("actor failed with status OK"));
+                    backtrace.clear();
                 }
                 Receipt {
                     exit_code,
-                    return_data: Default::default(),
+                    return_data,
                     gas_used,
+                    events_root,
                 }
             }
             Err(ExecutionError::OutOfGas) => Receipt {
                 exit_code: ExitCode::SYS_OUT_OF_GAS,
                 return_data: Default::default(),
                 gas_used,
+                events_root,
             },
             Err(ExecutionError::Syscall(err)) => {
                 // Errors indicate the message couldn't be dispatched at all
@@ -146,6 +230,7 @@ where
                     exit_code,
                     return_data: Default::default(),
                     gas_used,
+                    events_root,
                 }
             }
             Err(ExecutionError::Fatal(err)) => {
@@ -170,6 +255,7 @@ where
                     exit_code: ExitCode::SYS_ASSERTION_FAILED,
                     return_data: Default::default(),
                     gas_used: msg.gas_limit,
+                    events_root,
                 }
             }
         };
@@ -181,30 +267,34 @@ where
         };
 
         match apply_kind {
-            ApplyKind::Explicit => self
-                .finish_message(msg, receipt, failure_info, gas_cost)
-                .map(|mut apply_ret| {
-                    apply_ret.exec_trace = exec_trace;
-                    apply_ret
-                }),
+            ApplyKind::Explicit => self.finish_message(
+                sender_id,
+                msg,
+                receipt,
+                failure_info,
+                gas_cost,
+                exec_trace,
+                events,
+            ),
             ApplyKind::Implicit => Ok(ApplyRet {
                 msg_receipt: receipt,
                 penalty: TokenAmount::zero(),
                 miner_tip: TokenAmount::zero(),
-                base_fee_burn: TokenAmount::from(0),
-                over_estimation_burn: TokenAmount::from(0),
-                refund: TokenAmount::from(0),
+                base_fee_burn: TokenAmount::zero(),
+                over_estimation_burn: TokenAmount::zero(),
+                refund: TokenAmount::zero(),
                 gas_refund: 0,
                 gas_burned: 0,
                 failure_info,
                 exec_trace,
+                events,
             }),
         }
     }
 
     /// Flush the state-tree to the underlying blockstore.
     fn flush(&mut self) -> anyhow::Result<Cid> {
-        let k = (&mut **self).flush()?;
+        let k = (**self).flush()?;
         Ok(k)
     }
 }
@@ -214,20 +304,38 @@ where
     K: Kernel,
 {
     /// Create a new [`DefaultExecutor`] for executing messages on the [`Machine`].
-    pub fn new(m: <K::CallManager as CallManager>::Machine) -> Self {
-        Self(Some(m))
+    pub fn new(
+        engine_pool: EnginePool,
+        machine: <K::CallManager as CallManager>::Machine,
+    ) -> anyhow::Result<Self> {
+        // Skip preloading all builtin actors when testing.
+        #[cfg(not(any(test, feature = "testing")))]
+        {
+            // Preload any uncached modules.
+            // This interface works for now because we know all actor CIDs
+            // ahead of time, but with user-supplied code, we won't have that
+            // guarantee.
+            engine_pool.acquire().preload(
+                machine.blockstore(),
+                machine.builtin_actors().builtin_actor_codes(),
+            )?;
+        }
+        Ok(Self {
+            engine_pool,
+            machine: Some(machine),
+        })
     }
 
     /// Consume consumes the executor and returns the Machine. If the Machine had
     /// been poisoned during execution, the Option will be None.
     pub fn into_machine(self) -> Option<<K::CallManager as CallManager>::Machine> {
-        self.0
+        self.machine
     }
 
     // TODO: The return type here is very strange because we have three cases:
-    //  1. Continue (return actor ID & gas).
-    //  2. Short-circuit (return ApplyRet).
-    //  3. Fail (return an error).
+    //  1. Continue: Return sender ID, & gas.
+    //  2. Short-circuit: Return ApplyRet.
+    //  3. Fail: Return an error.
     //  We could use custom types, but that would be even more annoying.
     fn preflight_message(
         &mut self,
@@ -284,9 +392,9 @@ where
             return Ok(Ok((sender_id, TokenAmount::zero(), inclusion_cost)));
         }
 
-        let sender = match self
+        let mut sender_state = match self
             .state_tree()
-            .get_actor(&Address::new_id(sender_id))
+            .get_actor(sender_id)
             .with_context(|| format!("failed to lookup actor {}", &msg.from))?
         {
             Some(act) => act,
@@ -299,62 +407,115 @@ where
             }
         };
 
-        // If sender is not an account actor, the message is invalid.
-        let sender_is_account = self
-            .builtin_actors()
-            .get_by_left(&sender.code)
-            .map(Type::is_account_actor)
-            .unwrap_or(false);
+        // Sender is valid if it is:
+        // - an account actor
+        // - an Ethereum Externally Owned Address
+        // - a placeholder actor that has an f4 address in the EAM's namespace
 
-        if !sender_is_account {
+        let mut sender_is_valid = self.builtin_actors().is_account_actor(&sender_state.code)
+            || self
+                .builtin_actors()
+                .is_ethaccount_actor(&sender_state.code);
+
+        log::info!("Stg-01 :: sender_is_valid :: {:#?}", sender_is_valid);
+
+        if self
+            .builtin_actors()
+            .is_placeholder_actor(&sender_state.code)
+        {
+            sender_is_valid = true;
+        }
+
+        if sender_state.sequence == 0 &&
+            sender_state
+                .delegated_address
+                .map(|a| matches!(a.payload(), Payload::Delegated(da) if da.namespace() == EAM_ACTOR_ID))
+                .unwrap_or(false) {
+            sender_is_valid = true;
+            sender_state.code = *self.builtin_actors().get_ethaccount_code();
+        }
+
+        log::info!(
+            "is_account_actor :: {:#?}",
+            self.builtin_actors().is_account_actor(&sender_state.code)
+        );
+
+        log::info!(
+            "is_ethaccount_actor :: {:#?}",
+            self.builtin_actors()
+                .is_ethaccount_actor(&sender_state.code)
+        );
+
+        log::info!(
+            "is_placeholder_actor :: {:#?}",
+            self.builtin_actors()
+                .is_placeholder_actor(&sender_state.code)
+        );
+
+        log::info!(" sequence == 0 :: {:#?}", sender_state.sequence == 0);
+
+        log::info!("is EAM_ACTOR_ID :: {:#?}",             sender_state
+                .delegated_address
+                .map(|a| matches!(a.payload(), Payload::Delegated(da) if da.namespace() == EAM_ACTOR_ID))
+                .unwrap_or(false));
+
+        log::info!("Stg-02 :: sender_is_valid :: {:#?}", sender_is_valid);
+
+        if !sender_is_valid {
             return Ok(Err(ApplyRet::prevalidation_fail(
                 ExitCode::SYS_SENDER_INVALID,
-                "Send not from account actor",
+                "Send not from valid sender",
                 miner_penalty_amount,
             )));
         };
 
+        log::info!("Stg-03 :: sender_is_valid :: {:#?}", sender_is_valid);
+
         // Check sequence is correct
-        if msg.sequence != sender.sequence {
+        if msg.sequence != sender_state.sequence {
             return Ok(Err(ApplyRet::prevalidation_fail(
                 ExitCode::SYS_SENDER_STATE_INVALID,
                 format!(
                     "Actor sequence invalid: {} != {}",
-                    msg.sequence, sender.sequence
+                    msg.sequence, sender_state.sequence
                 ),
                 miner_penalty_amount,
             )));
         };
 
+        sender_state.sequence += 1;
+
         // Ensure from actor has enough balance to cover the gas cost of the message.
         let gas_cost: TokenAmount = msg.gas_fee_cap.clone() * msg.gas_limit;
-        if sender.balance < gas_cost {
+        if sender_state.balance < gas_cost {
             return Ok(Err(ApplyRet::prevalidation_fail(
                 ExitCode::SYS_SENDER_STATE_INVALID,
                 format!(
                     "Actor balance less than needed: {} < {}",
-                    sender.balance, gas_cost
+                    sender_state.balance, gas_cost
                 ),
                 miner_penalty_amount,
             )));
         }
 
-        // Deduct message inclusion gas cost and increment sequence.
-        self.state_tree_mut().mutate_actor_id(sender_id, |act| {
-            act.deduct_funds(&gas_cost)?;
-            act.sequence += 1;
-            Ok(())
-        })?;
+        sender_state.deduct_funds(&gas_cost)?;
+
+        // Update the actor in the state tree
+        self.state_tree_mut().set_actor(sender_id, sender_state);
 
         Ok(Ok((sender_id, gas_cost, inclusion_cost)))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn finish_message(
         &mut self,
+        sender_id: ActorID,
         msg: Message,
         receipt: Receipt,
         failure_info: Option<ApplyFailure>,
-        gas_cost: BigInt,
+        gas_cost: TokenAmount,
+        exec_trace: ExecutionTrace,
+        events: Vec<StampedEvent>,
     ) -> anyhow::Result<ApplyRet> {
         // NOTE: we don't support old network versions in the FVM, so we always burn.
         let GasOutputs {
@@ -373,8 +534,8 @@ where
             &msg.gas_premium,
         );
 
-        let mut transfer_to_actor = |addr: &Address, amt: &TokenAmount| -> anyhow::Result<()> {
-            if amt.sign() == Sign::Minus {
+        let mut transfer_to_actor = |addr: ActorID, amt: &TokenAmount| -> anyhow::Result<()> {
+            if amt.is_negative() {
                 return Err(anyhow!("attempted to transfer negative value into actor"));
             }
             if amt.is_zero() {
@@ -390,14 +551,14 @@ where
             Ok(())
         };
 
-        transfer_to_actor(&BURNT_FUNDS_ACTOR_ADDR, &base_fee_burn)?;
+        transfer_to_actor(BURNT_FUNDS_ACTOR_ID, &base_fee_burn)?;
 
-        transfer_to_actor(&REWARD_ACTOR_ADDR, &miner_tip)?;
+        transfer_to_actor(REWARD_ACTOR_ID, &miner_tip)?;
 
-        transfer_to_actor(&BURNT_FUNDS_ACTOR_ADDR, &over_estimation_burn)?;
+        transfer_to_actor(BURNT_FUNDS_ACTOR_ID, &over_estimation_burn)?;
 
         // refund unused gas
-        transfer_to_actor(&msg.from, &refund)?;
+        transfer_to_actor(sender_id, &refund)?;
 
         if (&base_fee_burn + &over_estimation_burn + &refund + &miner_tip) != gas_cost {
             // Sanity check. This could be a fatal error.
@@ -413,7 +574,8 @@ where
             gas_refund,
             gas_burned,
             failure_info,
-            exec_trace: vec![],
+            exec_trace,
+            events,
         })
     }
 
@@ -424,7 +586,7 @@ where
         ) -> (T, <K::CallManager as CallManager>::Machine),
     {
         replace_with::replace_with_and_return(
-            &mut self.0,
+            &mut self.machine,
             || None,
             |m| {
                 let (ret, machine) = f(m.unwrap());

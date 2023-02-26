@@ -1,47 +1,55 @@
+// Copyright 2021-2023 Protocol Labs
+// SPDX-License-Identifier: Apache-2.0, MIT
 use std::collections::BTreeMap;
 use std::convert::{TryFrom, TryInto};
 use std::panic::{self, UnwindSafe};
 use std::path::PathBuf;
 
 use anyhow::{anyhow, Context as _};
-use byteorder::{BigEndian, WriteBytesExt};
 use cid::Cid;
 use filecoin_proofs_api::{self as proofs, ProverId, PublicReplicaInfo, SectorId};
 use fvm_ipld_blockstore::Blockstore;
-use fvm_ipld_encoding::{bytes_32, from_slice, to_vec};
-use fvm_shared::actor::builtin::Type;
-use fvm_shared::address::Protocol;
-use fvm_shared::bigint::{BigInt, Zero};
+use fvm_ipld_encoding::{bytes_32, IPLD_RAW};
+use fvm_shared::address::Payload;
+use fvm_shared::bigint::Zero;
 use fvm_shared::consensus::ConsensusFault;
-use fvm_shared::crypto::hash::SupportedHashes;
 use fvm_shared::crypto::signature;
 use fvm_shared::econ::TokenAmount;
 use fvm_shared::error::ErrorNumber;
+use fvm_shared::event::ActorEvent;
 use fvm_shared::piece::{zero_piece_commitment, PaddedPieceSize};
 use fvm_shared::sector::SectorInfo;
-use fvm_shared::version::NetworkVersion;
-use fvm_shared::{commcid, ActorID, FILECOIN_PRECISION};
+use fvm_shared::sys::out::vm::ContextFlags;
+use fvm_shared::{commcid, ActorID};
 use lazy_static::lazy_static;
 use multihash::MultihashDigest;
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
+use rayon::prelude::ParallelDrainRange;
 
 use super::blocks::{Block, BlockRegistry};
 use super::error::Result;
+use super::hash::SupportedHashes;
 use super::*;
 use crate::call_manager::{CallManager, InvocationResult, NO_DATA_BLOCK_ID};
-use crate::externs::{Consensus, Rand};
-use crate::gas::GasCharge;
+use crate::externs::{Chain, Consensus, Rand};
+use crate::gas::GasTimer;
+use crate::init_actor::INIT_ACTOR_ID;
+use crate::machine::{MachineContext, NetworkConfig};
 use crate::state_tree::ActorState;
-use crate::{syscall_error, EMPTY_ARR_CID};
+use crate::syscall_error;
 
 lazy_static! {
     static ref NUM_CPUS: usize = num_cpus::get();
-    static ref INITIAL_RESERVE_BALANCE: BigInt = BigInt::from(300_000_000) * FILECOIN_PRECISION;
+    static ref INITIAL_RESERVE_BALANCE: TokenAmount = TokenAmount::from_whole(300_000_000);
 }
 
 const BLAKE2B_256: u64 = 0xb220;
 const ENV_ARTIFACT_DIR: &str = "FVM_STORE_ARTIFACT_DIR";
 const MAX_ARTIFACT_NAME_LEN: usize = 256;
+const FINALITY: i64 = 900;
+
+#[cfg(feature = "testing")]
+const TEST_ACTOR_ALLOWED_TO_CALL_CREATE_ACTOR: ActorID = 98;
 
 /// The "default" [`Kernel`] implementation.
 pub struct DefaultKernel<C> {
@@ -51,6 +59,7 @@ pub struct DefaultKernel<C> {
     actor_id: ActorID,
     method: MethodNum,
     value_received: TokenAmount,
+    read_only: bool,
 
     /// The call manager for this call stack. If this kernel calls another actor, it will
     /// temporarily "give" the call manager to the other kernel before re-attaching it.
@@ -84,6 +93,7 @@ where
         actor_id: ActorID,
         method: MethodNum,
         value_received: TokenAmount,
+        read_only: bool,
     ) -> Self {
         DefaultKernel {
             call_manager: mgr,
@@ -92,7 +102,12 @@ where
             actor_id,
             method,
             value_received,
+            read_only,
         }
+    }
+
+    fn machine(&self) -> &<Self::CallManager as CallManager>::Machine {
+        self.call_manager.machine()
     }
 }
 
@@ -100,88 +115,9 @@ impl<C> DefaultKernel<C>
 where
     C: CallManager,
 {
-    fn resolve_to_key_addr(&mut self, addr: &Address, charge_gas: bool) -> Result<Address> {
-        if addr.protocol() == Protocol::BLS || addr.protocol() == Protocol::Secp256k1 {
-            return Ok(*addr);
-        }
-
-        let act = self
-            .call_manager
-            .machine()
-            .state_tree()
-            .get_actor(addr)?
-            .context("state tree doesn't contain actor")
-            .or_error(ErrorNumber::NotFound)?;
-
-        let is_account = self
-            .call_manager
-            .machine()
-            .builtin_actors()
-            .get_by_left(&act.code)
-            .map(Type::is_account_actor)
-            .unwrap_or(false);
-
-        if !is_account {
-            // TODO: this is wrong. Maybe some InvalidActor type?
-            // The argument is syntactically correct, but semantically wrong.
-            return Err(syscall_error!(IllegalArgument; "target actor is not an account").into());
-        }
-
-        if charge_gas {
-            self.call_manager
-                .charge_gas(self.call_manager.price_list().on_block_open_base())?;
-        }
-
-        let state_block = self
-            .call_manager
-            .state_tree()
-            .store()
-            .get(&act.state)
-            .context("failed to look up state")
-            .or_fatal()?
-            .context("account actor state not found")
-            .or_fatal()?;
-
-        if charge_gas {
-            self.call_manager.charge_gas(
-                self.call_manager
-                    .price_list()
-                    .on_block_open_per_byte(state_block.len()),
-            )?;
-        }
-
-        let state: crate::account_actor::State = from_slice(&state_block)
-            .context("failed to decode actor state as an account")
-            .or_fatal()?; // because we've checked and this should be an account.
-
-        Ok(state.address)
-    }
-
     /// Returns `Some(actor_state)` or `None` if this actor has been deleted.
     fn get_self(&self) -> Result<Option<ActorState>> {
-        self.call_manager
-            .state_tree()
-            .get_actor_id(self.actor_id)
-            .or_fatal()
-            .context("error when finding current actor")
-    }
-
-    /// Mutates this actor's state, returning a syscall error if this actor has been deleted.
-    fn mutate_self<F>(&mut self, mutate: F) -> Result<()>
-    where
-        F: FnOnce(&mut ActorState) -> Result<()>,
-    {
-        self.call_manager
-            .state_tree_mut()
-            .maybe_mutate_actor_id(self.actor_id, mutate)
-            .context("failed to mutate self")
-            .and_then(|found| {
-                if found {
-                    Ok(())
-                } else {
-                    Err(syscall_error!(IllegalOperation; "actor deleted").into())
-                }
-            })
+        self.call_manager.get_actor(self.actor_id)
     }
 }
 
@@ -191,29 +127,48 @@ where
 {
     fn root(&self) -> Result<Cid> {
         // This can fail during normal operations if the actor has been deleted.
-        Ok(self
+        let cid = self
             .get_self()?
             .context("state root requested after actor deletion")
             .or_error(ErrorNumber::IllegalOperation)?
-            .state)
+            .state;
+
+        Ok(cid)
     }
 
     fn set_root(&mut self, new: Cid) -> Result<()> {
-        self.mutate_self(|actor_state| {
-            actor_state.state = new;
-            Ok(())
-        })
+        if self.read_only {
+            return Err(
+                syscall_error!(ReadOnly; "cannot update the state-root while read-only").into(),
+            );
+        }
+        let mut state = self
+            .call_manager
+            .get_actor(self.actor_id)?
+            .ok_or_else(|| syscall_error!(IllegalOperation; "actor deleted"))?;
+        state.state = new;
+        self.call_manager.set_actor(self.actor_id, state)?;
+        Ok(())
     }
 
     fn current_balance(&self) -> Result<TokenAmount> {
+        let t = self
+            .call_manager
+            .charge_gas(self.call_manager.price_list().on_self_balance())?;
+
         // If the actor doesn't exist, it has zero balance.
-        Ok(self.get_self()?.map(|a| a.balance).unwrap_or_default())
+        t.record(Ok(self.get_self()?.map(|a| a.balance).unwrap_or_default()))
     }
 
     fn self_destruct(&mut self, beneficiary: &Address) -> Result<()> {
+        if self.read_only {
+            return Err(syscall_error!(ReadOnly; "cannot self-destruct when read-only").into());
+        }
+
         // Idempotentcy: If the actor doesn't exist, this won't actually do anything. The current
         // balance will be zero, and `delete_actor_id` will be a no-op.
-        self.call_manager
+        let t = self
+            .call_manager
             .charge_gas(self.call_manager.price_list().on_delete_actor())?;
 
         let balance = self.current_balance()?;
@@ -222,10 +177,7 @@ where
             // exists; if missing, it fails the self destruct.
             //
             // In FVM we check unconditionally, since we only support nv13+.
-            let beneficiary_id = self
-                .resolve_address(beneficiary)?
-                .context("beneficiary doesn't exist")
-                .or_error(ErrorNumber::NotFound)?;
+            let beneficiary_id = self.resolve_address(beneficiary)?;
 
             if beneficiary_id == self.actor_id {
                 return Err(syscall_error!(Forbidden, "benefactor cannot be beneficiary").into());
@@ -233,14 +185,11 @@ where
 
             // Transfer the entirety of funds to beneficiary.
             self.call_manager
-                .machine_mut()
                 .transfer(self.actor_id, beneficiary_id, &balance)?;
         }
 
         // Delete the executing actor
-        self.call_manager
-            .state_tree_mut()
-            .delete_actor_id(self.actor_id)
+        t.record(self.call_manager.delete_actor(self.actor_id))
     }
 }
 
@@ -251,8 +200,11 @@ where
     fn block_open(&mut self, cid: &Cid) -> Result<(BlockId, BlockStat)> {
         // TODO(M2): Check for reachability here.
 
-        self.call_manager
+        let _ = self
+            .call_manager
             .charge_gas(self.call_manager.price_list().on_block_open_base())?;
+
+        let start = GasTimer::start();
 
         let data = self
             .call_manager
@@ -269,7 +221,7 @@ where
 
         let block = Block::new(cid.codec(), data);
 
-        self.call_manager.charge_gas(
+        let t = self.call_manager.charge_gas(
             self.call_manager
                 .price_list()
                 .on_block_open_per_byte(block.size() as usize),
@@ -277,29 +229,35 @@ where
 
         let stat = block.stat();
         let id = self.blocks.put(block)?;
+        t.stop_with(start);
         Ok((id, stat))
     }
 
     fn block_create(&mut self, codec: u64, data: &[u8]) -> Result<BlockId> {
-        self.call_manager
+        if data.len() > self.machine().context().max_block_size {
+            return Err(syscall_error!(LimitExceeded; "blocks may not be larger than 1MiB").into());
+        }
+
+        let t = self
+            .call_manager
             .charge_gas(self.call_manager.price_list().on_block_create(data.len()))?;
 
-        Ok(self.blocks.put(Block::new(codec, data))?)
+        t.record(Ok(self.blocks.put(Block::new(codec, data))?))
     }
 
     fn block_link(&mut self, id: BlockId, hash_fun: u64, hash_len: u32) -> Result<Cid> {
         if hash_fun != BLAKE2B_256 || hash_len != 32 {
             return Err(syscall_error!(IllegalCid; "cids must be 32-byte blake2b").into());
         }
-
+        let start = GasTimer::start();
         let block = self.blocks.get(id)?;
-        let code = multihash::Code::try_from(hash_fun)
+        let code = SupportedHashes::try_from(hash_fun)
             .map_err(|_| syscall_error!(IllegalCid; "invalid CID codec"))?;
 
-        self.call_manager.charge_gas(
+        let t = self.call_manager.charge_gas(
             self.call_manager
                 .price_list()
-                .on_block_link(block.size() as usize),
+                .on_block_link(code, block.size() as usize),
         )?;
 
         let hash = code.digest(block.data());
@@ -314,10 +272,12 @@ where
             // TODO: This is really "super fatal". It means we failed to store state, and should
             // probably abort the entire block.
             .or_fatal()?;
+        t.stop_with(start);
         Ok(k)
     }
 
-    fn block_read(&mut self, id: BlockId, offset: u32, buf: &mut [u8]) -> Result<i32> {
+    fn block_read(&self, id: BlockId, offset: u32, buf: &mut [u8]) -> Result<i32> {
+        let tstart = GasTimer::start();
         // First, find the end of the _logical_ buffer (taking the offset into account).
         // This must fit into an i32.
 
@@ -337,7 +297,8 @@ where
         let to_read = std::cmp::min(data.len().saturating_sub(start), buf.len());
 
         // We can now _charge_, because we actually know how many bytes we need to read.
-        self.call_manager
+        let t = self
+            .call_manager
             .charge_gas(self.call_manager.price_list().on_block_read(to_read))?;
 
         // Copy into the output buffer, but only if were're reading. If to_read == 0, start may be
@@ -345,16 +306,17 @@ where
         if to_read != 0 {
             buf[..to_read].copy_from_slice(&data[start..(start + to_read)]);
         }
-
+        t.stop_with(tstart);
         // Returns the difference between the end of the block, and offset + buf.len()
         Ok((data.len() as i32) - end)
     }
 
-    fn block_stat(&mut self, id: BlockId) -> Result<BlockStat> {
-        self.call_manager
+    fn block_stat(&self, id: BlockId) -> Result<BlockStat> {
+        let t = self
+            .call_manager
             .charge_gas(self.call_manager.price_list().on_block_stat())?;
 
-        Ok(self.blocks.stat(id)?)
+        t.record(Ok(self.blocks.stat(id)?))
     }
 }
 
@@ -362,20 +324,35 @@ impl<C> MessageOps for DefaultKernel<C>
 where
     C: CallManager,
 {
-    fn msg_caller(&self) -> ActorID {
-        self.caller
-    }
+    fn msg_context(&self) -> Result<MessageContext> {
+        let t = self
+            .call_manager
+            .charge_gas(self.call_manager.price_list().on_message_context())?;
 
-    fn msg_receiver(&self) -> ActorID {
-        self.actor_id
-    }
-
-    fn msg_method_number(&self) -> MethodNum {
-        self.method
-    }
-
-    fn msg_value_received(&self) -> TokenAmount {
-        self.value_received.clone()
+        let ctx = MessageContext {
+            caller: self.caller,
+            origin: self.call_manager.origin(),
+            receiver: self.actor_id,
+            method_number: self.method,
+            value_received: (&self.value_received)
+                .try_into()
+                .or_fatal()
+                .context("invalid token amount")?,
+            gas_premium: self
+                .call_manager
+                .gas_premium()
+                .try_into()
+                .or_fatal()
+                .context("invalid gas premium")?,
+            flags: if self.read_only {
+                ContextFlags::READ_ONLY
+            } else {
+                ContextFlags::empty()
+            },
+            nonce: self.call_manager.nonce(),
+        };
+        t.stop();
+        Ok(ctx)
     }
 }
 
@@ -389,8 +366,15 @@ where
         method: MethodNum,
         params_id: BlockId,
         value: &TokenAmount,
+        gas_limit: Option<Gas>,
+        flags: SendFlags,
     ) -> Result<SendResult> {
         let from = self.actor_id;
+        let read_only = self.read_only || flags.read_only();
+
+        if read_only && !value.is_zero() {
+            return Err(syscall_error!(ReadOnly; "cannot transfer value when read-only").into());
+        }
 
         // Load parameters.
         let params = if params_id == NO_DATA_BLOCK_ID {
@@ -405,25 +389,38 @@ where
         }
 
         // Send.
-        let result = self
-            .call_manager
-            .with_transaction(|cm| cm.send::<Self>(from, *recipient, method, params, value))?;
+        let result = self.call_manager.with_transaction(|cm| {
+            cm.send::<Self>(
+                from, *recipient, method, params, value, gas_limit, read_only,
+            )
+        })?;
 
         // Store result and return.
         Ok(match result {
-            InvocationResult::Return(None) => {
-                SendResult::Return(NO_DATA_BLOCK_ID, BlockStat { codec: 0, size: 0 })
-            }
-            InvocationResult::Return(Some(blk)) => {
-                let stat = blk.stat();
-                let ret_id = self
+            InvocationResult {
+                exit_code,
+                value: Some(blk),
+            } => {
+                let block_stat = blk.stat();
+                let block_id = self
                     .blocks
                     .put(blk)
                     .or_fatal()
                     .context("failed to store a valid return value")?;
-                SendResult::Return(ret_id, stat)
+                SendResult {
+                    block_id,
+                    block_stat,
+                    exit_code,
+                }
             }
-            InvocationResult::Failure(code) => SendResult::Abort(code),
+            InvocationResult {
+                exit_code,
+                value: None,
+            } => SendResult {
+                block_id: NO_DATA_BLOCK_ID,
+                block_stat: BlockStat { codec: 0, size: 0 },
+                exit_code,
+            },
         })
     }
 }
@@ -445,44 +442,54 @@ where
     C: CallManager,
 {
     fn verify_signature(
-        &mut self,
+        &self,
         sig_type: SignatureType,
         signature: &[u8],
         signer: &Address,
         plaintext: &[u8],
     ) -> Result<bool> {
-        self.call_manager
-            .charge_gas(self.call_manager.price_list().on_verify_signature(sig_type))?;
+        let t = self.call_manager.charge_gas(
+            self.call_manager
+                .price_list()
+                .on_verify_signature(sig_type, plaintext.len()),
+        )?;
 
-        // Resolve to key address before verifying signature.
-        let signing_addr = self.resolve_to_key_addr(signer, true)?;
+        // We only support key addresses (f1/f3). This change does not require a FIP, because no
+        // actors invoke this method with non-key addresses.
+        let signing_addr = match signer.payload() {
+            Payload::BLS(_) | Payload::Secp256k1(_) => *signer,
+            // Not a key address.
+            _ => {
+                return Err(syscall_error!(IllegalArgument; "address protocol {} not supported", signer.protocol()).into());
+            }
+        };
 
         // Verify signature, catching errors. Signature verification can include some complicated
         // math.
-        catch_and_log_panic("verifying signature", || {
+        t.record(catch_and_log_panic("verifying signature", || {
             Ok(signature::verify(sig_type, signature, plaintext, &signing_addr).is_ok())
-        })
+        }))
     }
 
     fn recover_secp_public_key(
-        &mut self,
+        &self,
         hash: &[u8; SECP_SIG_MESSAGE_HASH_SIZE],
         signature: &[u8; SECP_SIG_LEN],
     ) -> Result<[u8; SECP_PUB_LEN]> {
-        self.call_manager
+        let t = self
+            .call_manager
             .charge_gas(self.call_manager.price_list().on_recover_secp_public_key())?;
 
-        signature::ops::recover_secp_public_key(hash, signature)
-            .map(|pubkey| pubkey.serialize())
-            .map_err(|e| {
-                syscall_error!(IllegalArgument; "public key recovery failed: {}", e).into()
-            })
+        t.record(
+            signature::ops::recover_secp_public_key(hash, signature)
+                .map(|pubkey| pubkey.serialize())
+                .map_err(|e| {
+                    syscall_error!(IllegalArgument; "public key recovery failed: {}", e).into()
+                }),
+        )
     }
 
-    fn hash(&mut self, code: u64, data: &[u8]) -> Result<MultihashGeneric<64>> {
-        self.call_manager
-            .charge_gas(self.call_manager.price_list().on_hashing(data.len()))?;
-
+    fn hash(&self, code: u64, data: &[u8]) -> Result<MultihashGeneric<64>> {
         let hasher = SupportedHashes::try_from(code).map_err(|e| {
             if let multihash::Error::UnsupportedCode(code) = e {
                 syscall_error!(IllegalArgument; "unsupported hash code {}", code)
@@ -490,81 +497,97 @@ where
                 syscall_error!(AssertionFailed; "hash expected unsupported code, got {}", e)
             }
         })?;
-        Ok(hasher.digest(data))
+
+        let t = self.call_manager.charge_gas(
+            self.call_manager
+                .price_list()
+                .on_hashing(hasher, data.len()),
+        )?;
+
+        t.record(Ok(hasher.digest(data)))
     }
 
     fn compute_unsealed_sector_cid(
-        &mut self,
+        &self,
         proof_type: RegisteredSealProof,
         pieces: &[PieceInfo],
     ) -> Result<Cid> {
-        self.call_manager.charge_gas(
+        let t = self.call_manager.charge_gas(
             self.call_manager
                 .price_list()
                 .on_compute_unsealed_sector_cid(proof_type, pieces),
         )?;
 
-        catch_and_log_panic("computing unsealed sector CID", || {
+        t.record(catch_and_log_panic("computing unsealed sector CID", || {
             compute_unsealed_sector_cid(proof_type, pieces)
-        })
+        }))
     }
 
     /// Verify seal proof for sectors. This proof verifies that a sector was sealed by the miner.
-    fn verify_seal(&mut self, vi: &SealVerifyInfo) -> Result<bool> {
-        self.call_manager
+    fn verify_seal(&self, vi: &SealVerifyInfo) -> Result<bool> {
+        let t = self
+            .call_manager
             .charge_gas(self.call_manager.price_list().on_verify_seal(vi))?;
 
         // It's probably _fine_ to just let these turn into fatal errors, but seal verification is
         // pretty self contained, so catching panics here probably doesn't hurt.
-        catch_and_log_panic("verifying seal", || verify_seal(vi))
+        t.record(catch_and_log_panic("verifying seal", || verify_seal(vi)))
     }
 
-    fn verify_post(&mut self, verify_info: &WindowPoStVerifyInfo) -> Result<bool> {
-        self.call_manager
+    fn verify_post(&self, verify_info: &WindowPoStVerifyInfo) -> Result<bool> {
+        let t = self
+            .call_manager
             .charge_gas(self.call_manager.price_list().on_verify_post(verify_info))?;
 
         // This is especially important to catch as, otherwise, a bad "post" could be undisputable.
-        catch_and_log_panic("verifying post", || verify_post(verify_info))
+        t.record(catch_and_log_panic("verifying post", || {
+            verify_post(verify_info)
+        }))
     }
 
     fn verify_consensus_fault(
-        &mut self,
+        &self,
         h1: &[u8],
         h2: &[u8],
         extra: &[u8],
     ) -> Result<Option<ConsensusFault>> {
-        self.call_manager
-            .charge_gas(self.call_manager.price_list().on_verify_consensus_fault())?;
+        let t = self.call_manager.charge_gas(
+            self.call_manager.price_list().on_verify_consensus_fault(
+                h1.len(),
+                h2.len(),
+                extra.len(),
+            ),
+        )?;
 
         // This syscall cannot be resolved inside the FVM, so we need to traverse
         // the node boundary through an extern.
-        let (fault, gas) = self
-            .call_manager
-            .externs()
-            .verify_consensus_fault(h1, h2, extra)
-            .or_illegal_argument()?;
-
-        if self.network_version() <= NetworkVersion::V15 {
-            self.call_manager.charge_gas(GasCharge::new(
-                "verify_consensus_fault_accesses",
-                Gas::new(gas),
-                Gas::zero(),
-            ))?;
-        }
+        let (fault, _) = t.record(
+            self.call_manager
+                .externs()
+                .verify_consensus_fault(h1, h2, extra)
+                .or_illegal_argument(),
+        )?;
 
         Ok(fault)
     }
 
-    fn batch_verify_seals(&mut self, vis: &[SealVerifyInfo]) -> Result<Vec<bool>> {
+    fn batch_verify_seals(&self, vis: &[SealVerifyInfo]) -> Result<Vec<bool>> {
         // NOTE: gas has already been charged by the power actor when the batch verify was enqueued.
         // Lotus charges "virtual" gas here for tracing only.
+        let mut items = Vec::new();
+        for vi in vis {
+            let t = self
+                .call_manager
+                .charge_gas(self.call_manager.price_list().on_verify_seal(vi))?;
+            items.push((vi, t));
+        }
         log::debug!("batch verify seals start");
-        let out = vis
-            .par_iter()
+        let out = items.par_drain(..)
             .with_min_len(vis.len() / *NUM_CPUS)
-            .map(|seal| {
+            .map(|(seal, timer)| {
+                let start = GasTimer::start();
                 let verify_seal_result = std::panic::catch_unwind(|| verify_seal(seal));
-                match verify_seal_result {
+                let ok = match verify_seal_result {
                     Ok(res) => {
                         match res {
                             Ok(correct) => {
@@ -590,36 +613,35 @@ where
                         log::error!("seal verify internal fail (miner: {}) (err: {:?})", seal.sector_id.miner, e);
                         false
                     }
-                }
+                };
+                timer.stop_with(start);
+                ok
             })
             .collect();
         log::debug!("batch verify seals end");
         Ok(out)
     }
 
-    fn verify_aggregate_seals(
-        &mut self,
-        aggregate: &AggregateSealVerifyProofAndInfos,
-    ) -> Result<bool> {
-        self.call_manager.charge_gas(
+    fn verify_aggregate_seals(&self, aggregate: &AggregateSealVerifyProofAndInfos) -> Result<bool> {
+        let t = self.call_manager.charge_gas(
             self.call_manager
                 .price_list()
                 .on_verify_aggregate_seals(aggregate),
         )?;
-        catch_and_log_panic("verifying aggregate seals", || {
+        t.record(catch_and_log_panic("verifying aggregate seals", || {
             verify_aggregate_seals(aggregate)
-        })
+        }))
     }
 
-    fn verify_replica_update(&mut self, replica: &ReplicaUpdateInfo) -> Result<bool> {
-        self.call_manager.charge_gas(
+    fn verify_replica_update(&self, replica: &ReplicaUpdateInfo) -> Result<bool> {
+        let t = self.call_manager.charge_gas(
             self.call_manager
                 .price_list()
                 .on_verify_replica_update(replica),
         )?;
-        catch_and_log_panic("verifying replica update", || {
+        t.record(catch_and_log_panic("verifying replica update", || {
             verify_replica_update(replica)
-        })
+        }))
     }
 }
 
@@ -635,10 +657,8 @@ where
         self.call_manager.gas_tracker().gas_available()
     }
 
-    fn charge_gas(&mut self, name: &str, compute: Gas) -> Result<()> {
-        self.call_manager
-            .gas_tracker_mut()
-            .charge_gas(name, compute)
+    fn charge_gas(&self, name: &str, compute: Gas) -> Result<GasTimer> {
+        self.call_manager.gas_tracker().charge_gas(name, compute)
     }
 
     fn price_list(&self) -> &PriceList {
@@ -650,16 +670,66 @@ impl<C> NetworkOps for DefaultKernel<C>
 where
     C: CallManager,
 {
-    fn network_epoch(&self) -> ChainEpoch {
-        self.call_manager.context().epoch
+    fn network_context(&self) -> Result<NetworkContext> {
+        let t = self
+            .call_manager
+            .charge_gas(self.call_manager.price_list().on_network_context())?;
+
+        let MachineContext {
+            epoch,
+            timestamp,
+            base_fee,
+            network:
+                NetworkConfig {
+                    network_version,
+                    chain_id,
+                    ..
+                },
+            ..
+        } = self.call_manager.context();
+
+        let ctx = NetworkContext {
+            chain_id: (*chain_id).into(),
+            epoch: *epoch,
+            network_version: *network_version,
+            timestamp: *timestamp,
+            base_fee: base_fee
+                .try_into()
+                .or_fatal()
+                .context("base-fee exceeds u128 limit")?,
+        };
+
+        t.stop();
+        Ok(ctx)
     }
 
-    fn network_version(&self) -> NetworkVersion {
-        self.call_manager.context().network_version
-    }
+    fn tipset_cid(&self, epoch: ChainEpoch) -> Result<Cid> {
+        use std::cmp::Ordering::*;
 
-    fn network_base_fee(&self) -> &TokenAmount {
-        &self.call_manager.context().base_fee
+        if epoch < 0 {
+            return Err(syscall_error!(IllegalArgument; "epoch is negative").into());
+        }
+        let offset = self.call_manager.context().epoch - epoch;
+
+        // Can't lookup the current tipset CID, or a future tipset CID>
+        match offset.cmp(&0) {
+            Less => return Err(syscall_error!(IllegalArgument; "epoch {} is in the future", epoch).into()),
+            Equal => return Err(syscall_error!(IllegalArgument; "cannot lookup the tipset cid for the current epoch").into()),
+            Greater => {},
+        }
+
+        // Can't lookup tipset CIDs beyond finality.
+        if offset >= FINALITY {
+            return Err(
+                syscall_error!(IllegalArgument; "epoch {} is too far in the past", epoch).into(),
+            );
+        }
+
+        let _ = self
+            .call_manager
+            .charge_gas(self.call_manager.price_list().on_tipset_cid(offset > 1));
+
+        self.call_manager.externs().get_tipset_cid(epoch).or_fatal()
     }
 }
 
@@ -668,12 +738,12 @@ where
     C: CallManager,
 {
     fn get_randomness_from_tickets(
-        &mut self,
+        &self,
         personalization: i64,
         rand_epoch: ChainEpoch,
         entropy: &[u8],
     ) -> Result<[u8; RANDOMNESS_LENGTH]> {
-        self.call_manager.charge_gas(
+        let t = self.call_manager.charge_gas(
             self.call_manager
                 .price_list()
                 .on_get_randomness(entropy.len()),
@@ -681,19 +751,21 @@ where
 
         // TODO(M2): Check error code
         // Specifically, lookback length?
-        self.call_manager
-            .externs()
-            .get_chain_randomness(personalization, rand_epoch, entropy)
-            .or_illegal_argument()
+        t.record(
+            self.call_manager
+                .externs()
+                .get_chain_randomness(personalization, rand_epoch, entropy)
+                .or_illegal_argument(),
+        )
     }
 
     fn get_randomness_from_beacon(
-        &mut self,
+        &self,
         personalization: i64,
         rand_epoch: ChainEpoch,
         entropy: &[u8],
     ) -> Result<[u8; RANDOMNESS_LENGTH]> {
-        self.call_manager.charge_gas(
+        let t = self.call_manager.charge_gas(
             self.call_manager
                 .price_list()
                 .on_get_randomness(entropy.len()),
@@ -701,10 +773,12 @@ where
 
         // TODO(M2): Check error code
         // Specifically, lookback length?
-        self.call_manager
-            .externs()
-            .get_beacon_randomness(personalization, rand_epoch, entropy)
-            .or_illegal_argument()
+        t.record(
+            self.call_manager
+                .externs()
+                .get_beacon_randomness(personalization, rand_epoch, entropy)
+                .or_illegal_argument(),
+        )
     }
 }
 
@@ -712,95 +786,130 @@ impl<C> ActorOps for DefaultKernel<C>
 where
     C: CallManager,
 {
-    fn resolve_address(&self, address: &Address) -> Result<Option<ActorID>> {
-        self.call_manager.state_tree().lookup_id(address)
-    }
-
-    fn get_actor_code_cid(&self, id: ActorID) -> Result<Option<Cid>> {
-        Ok(self
+    fn resolve_address(&self, address: &Address) -> Result<ActorID> {
+        let t = self
             .call_manager
-            .state_tree()
-            .get_actor_id(id)
-            .context("failed to lookup actor to get code CID")
-            .or_fatal()?
-            .map(|act| act.code))
+            .charge_gas(self.call_manager.price_list().on_resolve_address())?;
+
+        t.record(Ok(self
+            .call_manager
+            .resolve_address(address)?
+            .ok_or_else(|| syscall_error!(NotFound; "actor not found"))?))
     }
 
-    // TODO(M2) merge new_actor_address and create_actor into a single syscall.
-    fn new_actor_address(&mut self) -> Result<Address> {
-        let oa = self
-            .resolve_to_key_addr(&self.call_manager.origin(), false)
-            // This is already an execution error, but we're _making_ it fatal.
-            .or_fatal()?;
+    fn get_actor_code_cid(&self, id: ActorID) -> Result<Cid> {
+        let t = self
+            .call_manager
+            .charge_gas(self.call_manager.price_list().on_get_actor_code_cid())?;
 
-        let mut b = to_vec(&oa)
-            .or_fatal()
-            .context("could not serialize address in new_actor_address")?;
-        b.write_u64::<BigEndian>(self.call_manager.nonce())
-            .or_fatal()
-            .context("writing nonce into a buffer")?;
-        b.write_u64::<BigEndian>(self.call_manager.next_actor_idx())
-            .or_fatal()
-            .context("writing actor index in buffer")?;
-        let addr = Address::new_actor(&b);
-        Ok(addr)
+        t.record(Ok(self
+            .call_manager
+            .get_actor(id)?
+            .ok_or_else(|| syscall_error!(NotFound; "actor not found"))?
+            .code))
     }
 
-    // TODO(M2) merge new_actor_address and create_actor into a single syscall.
-    fn create_actor(&mut self, code_id: Cid, actor_id: ActorID) -> Result<()> {
-        // TODO https://github.com/filecoin-project/builtin-actors/issues/492
-        let singleton = self
-            .get_builtin_actor_type(&code_id)
-            .as_ref()
-            .map(Type::is_singleton_actor)
-            .unwrap_or(false);
-        if singleton {
+    fn next_actor_address(&self) -> Result<Address> {
+        Ok(self.call_manager.next_actor_address())
+    }
+
+    fn create_actor(
+        &mut self,
+        code_id: Cid,
+        actor_id: ActorID,
+        delegated_address: Option<Address>,
+    ) -> Result<()> {
+        let is_allowed_to_create_actor = self.actor_id == INIT_ACTOR_ID;
+
+        #[cfg(feature = "testing")]
+        let is_allowed_to_create_actor =
+            is_allowed_to_create_actor || self.actor_id == TEST_ACTOR_ALLOWED_TO_CALL_CREATE_ACTOR;
+
+        if !is_allowed_to_create_actor {
+            return Err(syscall_error!(
+                Forbidden,
+                "create_actor is restricted to InitActor. Called by {}",
+                self.actor_id
+            )
+            .into());
+        }
+
+        if self.read_only {
             return Err(
-                syscall_error!(Forbidden; "can only have one instance of singleton actors").into(),
+                syscall_error!(ReadOnly, "create_actor cannot be called while read-only").into(),
             );
         }
 
-        let state_tree = self.call_manager.state_tree();
-        if let Ok(Some(_)) = state_tree.get_actor_id(actor_id) {
-            return Err(syscall_error!(Forbidden; "Actor address already exists").into());
-        }
-
         self.call_manager
-            .charge_gas(self.call_manager.price_list().on_create_actor())?;
+            .create_actor(code_id, actor_id, delegated_address)
+    }
 
-        let state_tree = self.call_manager.state_tree_mut();
-        state_tree.set_actor_id(
-            actor_id,
-            ActorState::new(code_id, *EMPTY_ARR_CID, 0.into(), 0),
+    fn get_builtin_actor_type(&self, code_cid: &Cid) -> Result<u32> {
+        let t = self
+            .call_manager
+            .charge_gas(self.call_manager.price_list().on_get_builtin_actor_type())?;
+
+        let id = self
+            .call_manager
+            .machine()
+            .builtin_actors()
+            .id_by_code(code_cid);
+
+        t.stop();
+        Ok(id)
+    }
+
+    fn get_code_cid_for_type(&self, typ: u32) -> Result<Cid> {
+        let t = self
+            .call_manager
+            .charge_gas(self.call_manager.price_list().on_get_code_cid_for_type())?;
+
+        t.record(
+            self.call_manager
+                .machine()
+                .builtin_actors()
+                .code_by_id(typ)
+                .cloned()
+                .context("tried to resolve CID of unrecognized actor type")
+                .or_illegal_argument(),
         )
-    }
-
-    fn get_builtin_actor_type(&self, code_cid: &Cid) -> Option<actor::builtin::Type> {
-        self.call_manager
-            .machine()
-            .builtin_actors()
-            .get_by_left(code_cid)
-            .cloned()
-    }
-
-    fn get_code_cid_for_type(&self, typ: actor::builtin::Type) -> Result<Cid> {
-        self.call_manager
-            .machine()
-            .builtin_actors()
-            .get_by_right(&typ)
-            .cloned()
-            .context("tried to resolve CID of unrecognized actor type")
-            .or_illegal_argument()
     }
 
     #[cfg(feature = "m2-native")]
     fn install_actor(&mut self, code_id: Cid) -> Result<()> {
-        // TODO figure out gas
-        self.call_manager
-            .machine()
+        let start = GasTimer::start();
+        let size = self
+            .call_manager
             .engine()
             .preload(self.call_manager.blockstore(), &[code_id])
-            .map_err(|_| syscall_error!(IllegalArgument; "failed to load actor code").into())
+            .map_err(|_| syscall_error!(IllegalArgument; "failed to load actor code"))?;
+
+        let t = self
+            .call_manager
+            .charge_gas(self.call_manager.price_list().on_install_actor(size))?;
+        t.stop_with(start);
+
+        Ok(())
+    }
+
+    fn balance_of(&self, actor_id: ActorID) -> Result<TokenAmount> {
+        let t = self
+            .call_manager
+            .charge_gas(self.call_manager.price_list().on_balance_of())?;
+
+        Ok(t.record(self.call_manager.get_actor(actor_id))?
+            .ok_or_else(|| syscall_error!(NotFound; "actor not found"))?
+            .balance)
+    }
+
+    fn lookup_delegated_address(&self, actor_id: ActorID) -> Result<Option<Address>> {
+        let t = self
+            .call_manager
+            .charge_gas(self.call_manager.price_list().on_lookup_delegated_address())?;
+
+        Ok(t.record(self.call_manager.get_actor(actor_id))?
+            .ok_or_else(|| syscall_error!(NotFound; "actor not found"))?
+            .delegated_address)
     }
 }
 
@@ -854,14 +963,76 @@ where
                 log::error!("failed to make directory to store debug artifacts {}", e);
             } else if let Err(e) = std::fs::write(dir.join(name), data) {
                 log::error!("failed to store debug artifact {}", e)
+            } else {
+                log::info!("wrote artifact: {} to {:?}", name, dir);
             }
-            log::info!("wrote artifact: {} to {:?}", name, dir);
         } else {
             log::error!(
                 "store_artifact was ignored, env var {} was not set",
                 ENV_ARTIFACT_DIR
             )
         }
+        Ok(())
+    }
+}
+
+impl<C> LimiterOps for DefaultKernel<C>
+where
+    C: CallManager,
+{
+    type Limiter = <<C as CallManager>::Machine as Machine>::Limiter;
+
+    fn limiter_mut(&mut self) -> &mut Self::Limiter {
+        self.call_manager.limiter_mut()
+    }
+}
+
+impl<C> EventOps for DefaultKernel<C>
+where
+    C: CallManager,
+{
+    fn emit_event(&mut self, raw_evt: &[u8]) -> Result<()> {
+        if self.read_only {
+            return Err(syscall_error!(ReadOnly; "cannot emit events while read-only").into());
+        }
+        let len = raw_evt.len() as usize;
+        let t = self
+            .call_manager
+            .charge_gas(self.call_manager.price_list().on_actor_event_validate(len))?;
+
+        // This is an over-estimation of the maximum event size, for safety. No valid event can even
+        // get close to this. We check this first so we don't try to decode a large event.
+        const MAX_ENCODED_SIZE: usize = 1 << 20;
+        if raw_evt.len() > MAX_ENCODED_SIZE {
+            return Err(syscall_error!(IllegalArgument; "event WAY too large").into());
+        }
+
+        let actor_evt = {
+            let res = match panic::catch_unwind(|| {
+                fvm_ipld_encoding::from_slice(raw_evt).or_error(ErrorNumber::IllegalArgument)
+            }) {
+                Ok(v) => v,
+                Err(e) => {
+                    log::error!("panic when decoding event cbor from actor: {:?}", e);
+                    Err(syscall_error!(IllegalArgument; "panic when decoding event cbor from actor").into())
+                }
+            };
+            t.stop();
+            res
+        }?;
+        validate_actor_event(&actor_evt)?;
+
+        let t = self.call_manager.charge_gas(
+            self.call_manager
+                .price_list()
+                .on_actor_event_accept(&actor_evt, len),
+        )?;
+
+        let stamped_evt = StampedEvent::new(self.actor_id, actor_evt);
+        self.call_manager.append_event(stamped_evt);
+
+        t.stop();
+
         Ok(())
     }
 }
@@ -874,6 +1045,35 @@ fn catch_and_log_panic<F: FnOnce() -> Result<R> + UnwindSafe, R>(context: &str, 
             Err(syscall_error!(IllegalArgument; "caught panic when {}: {:?}", context, e).into())
         }
     }
+}
+
+fn validate_actor_event(evt: &ActorEvent) -> Result<()> {
+    const MAX_ENTRIES: usize = 256;
+    const MAX_DATA: usize = 8 << 10;
+    const MAX_KEY_LEN: usize = 32;
+
+    if evt.entries.len() > MAX_ENTRIES {
+        return Err(syscall_error!(IllegalArgument; "event exceeded max entries: {} > {MAX_ENTRIES}", evt.entries.len()).into());
+    }
+    let mut total_value_size: usize = 0;
+    for entry in &evt.entries {
+        if entry.key.len() > MAX_KEY_LEN {
+            return Err(syscall_error!(IllegalArgument; "event key exceeded max size: {} > {MAX_KEY_LEN}", entry.key.len()).into());
+        }
+        if entry.codec != IPLD_RAW {
+            return Err(
+                syscall_error!(IllegalCodec; "event codec must be IPLD_RAW, was: {}", entry.codec)
+                    .into(),
+            );
+        }
+        total_value_size += entry.value.len();
+    }
+    if total_value_size > MAX_DATA {
+        return Err(
+            syscall_error!(IllegalArgument; "event total values exceeded max size: {total_value_size} > {MAX_DATA}").into(),
+        );
+    }
+    Ok(())
 }
 
 /// PoSt proof variants.

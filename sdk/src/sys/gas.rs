@@ -1,3 +1,5 @@
+// Copyright 2021-2023 Protocol Labs
+// SPDX-License-Identifier: Apache-2.0, MIT
 //! Syscalls for working with gas.
 
 // for documentation links
@@ -22,7 +24,6 @@ super::fvm_syscalls! {
     /// | [`IllegalArgument`] | invalid name buffer. |
     pub fn charge(name_off: *const u8, name_len: u32, amount: u64) -> Result<()>;
 
-    // Returns the amount of gas remaining.
-    // TODO not implemented.
-    // pub fn remaining() -> Result<u64>;
+    /// Returns the amount of gas remaining.
+    pub fn available() -> Result<u64>;
 }

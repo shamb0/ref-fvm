@@ -1,3 +1,4 @@
+// Copyright 2021-2023 Protocol Labs
 // Copyright 2019-2022 ChainSafe Systems
 // SPDX-License-Identifier: Apache-2.0, MIT
 
@@ -70,6 +71,7 @@ use std::borrow::Cow;
 #[cfg(feature = "enable-arbitrary")]
 use arbitrary::{size_hint, Arbitrary, Unstructured};
 pub use error::Error;
+use fvm_ipld_encoding::strict_bytes;
 pub use reader::BitReader;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 pub use writer::BitWriter;
@@ -89,7 +91,7 @@ impl Serialize for BitField {
                 bytes.len()
             )));
         }
-        serde_bytes::serialize(&bytes, serializer)
+        strict_bytes::serialize(&bytes, serializer)
     }
 }
 
@@ -98,7 +100,7 @@ impl<'de> Deserialize<'de> for BitField {
     where
         D: Deserializer<'de>,
     {
-        let bytes: Cow<'de, [u8]> = serde_bytes::deserialize(deserializer)?;
+        let bytes: Cow<'de, [u8]> = strict_bytes::deserialize(deserializer)?;
         if bytes.len() > MAX_ENCODED_SIZE {
             return Err(serde::de::Error::custom(format!(
                 "encoded bitfield was too large {}",

@@ -1,5 +1,5 @@
-mod ops;
-
+// Copyright 2021-2023 Protocol Labs
+// SPDX-License-Identifier: Apache-2.0, MIT
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -8,8 +8,11 @@ use fvm::kernel::default::DefaultKernel;
 use fvm::kernel::{Block, BlockRegistry};
 use fvm::Kernel;
 use multihash::Code;
+use num_traits::Zero;
 
 use super::*;
+
+mod ops;
 
 type TestingKernel = DefaultKernel<DummyCallManager>;
 
@@ -19,7 +22,15 @@ pub fn build_inspecting_test() -> anyhow::Result<(TestingKernel, Rc<RefCell<Test
     let (call_manager, test_data) = dummy::DummyCallManager::new_stub();
     // variable for value inspection, only upgrade after done mutating to avoid panic
 
-    let kern = TestingKernel::new(call_manager, BlockRegistry::default(), 0, 0, 0, 0.into());
+    let kern = TestingKernel::new(
+        call_manager,
+        BlockRegistry::default(),
+        0,
+        0,
+        0,
+        Zero::zero(),
+        false,
+    );
     Ok((kern, test_data))
 }
 
@@ -31,7 +42,15 @@ pub fn build_inspecting_gas_test(
     let (call_manager, test_data) = dummy::DummyCallManager::new_with_gas(gas_tracker);
     // variable for value inspection, only upgrade after done mutating to avoid panic
 
-    let kern = TestingKernel::new(call_manager, BlockRegistry::default(), 0, 0, 0, 0.into());
+    let kern = TestingKernel::new(
+        call_manager,
+        BlockRegistry::default(),
+        0,
+        0,
+        0,
+        Zero::zero(),
+        false,
+    );
     Ok((kern, test_data))
 }
 

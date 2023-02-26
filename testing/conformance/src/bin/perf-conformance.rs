@@ -1,3 +1,4 @@
+// Copyright 2021-2023 Protocol Labs
 // Copyright 2019-2022 ChainSafe Systems
 // SPDX-License-Identifier: Apache-2.0, MIT
 
@@ -8,9 +9,9 @@ use std::path::Path;
 use conformance_tests::vector::{MessageVector, Selector, Variant};
 use conformance_tests::vm::{TestKernel, TestMachine};
 use fvm::executor::{ApplyKind, DefaultExecutor, Executor};
-use fvm::machine::Engine;
+use fvm::machine::{Engine, EngineConfig};
 use fvm_ipld_blockstore::MemoryBlockstore;
-use fvm_ipld_encoding::Cbor;
+use fvm_ipld_encoding::from_slice;
 use fvm_shared::address::Protocol;
 use fvm_shared::crypto::signature::SECP_SIG_LEN;
 use fvm_shared::message::Message;
@@ -42,6 +43,7 @@ fn main() {
         wasmtime::Config::default()
             .profiler(wasmtime::ProfilingStrategy::VTune)
             .expect("failed to configure profiler"),
+        EngineConfig::default(),
     )
     .expect("failed to construct engine");
 
@@ -59,14 +61,14 @@ pub fn run_variant_for_perf(
     itt_info: (*mut __itt_domain, *mut __itt_string_handle),
 ) {
     // Construct the Machine.
-    let machine = TestMachine::new_for_vector(v, variant, bs, engine.clone());
+    let machine = TestMachine::new_for_vector(v, variant, bs, engine.clone()).unwrap();
     let mut exec: DefaultExecutor<TestKernel> = DefaultExecutor::new(machine);
 
     let (itt_domain, itt_handle) = itt_info;
 
     // Apply all messages in the vector.
     for m in v.apply_messages.iter() {
-        let msg = Message::unmarshal_cbor(&m.bytes).unwrap();
+        let msg: Message = from_slice(&m.bytes).unwrap();
 
         // Execute the message.
         let mut raw_length = m.bytes.len();

@@ -1,14 +1,14 @@
+// Copyright 2021-2023 Protocol Labs
 // Copyright 2019-2022 ChainSafe Systems
 // SPDX-License-Identifier: Apache-2.0, MIT
 
 use cid::Cid;
 use fvm_ipld_encoding::repr::*;
 use fvm_ipld_encoding::tuple::*;
-use fvm_ipld_encoding::Cbor;
 use serde::{Deserialize, Serialize};
 
 /// Specifies the version of the state tree
-#[derive(Debug, PartialEq, Clone, Copy, PartialOrd, Serialize_repr, Deserialize_repr)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, PartialOrd, Serialize_repr, Deserialize_repr)]
 #[repr(u64)]
 pub enum StateTreeVersion {
     /// Corresponds to actors < v2
@@ -21,6 +21,8 @@ pub enum StateTreeVersion {
     V3,
     /// Corresponds to actors >= v5
     V4,
+    /// Corresponding to actors >= v10
+    V5,
 }
 
 /// State root information. Contains information about the version of the state tree,
@@ -36,8 +38,6 @@ pub struct StateRoot {
     /// Info. The structure depends on the state root version.
     pub info: Cid,
 }
-
-impl Cbor for StateRoot {}
 
 /// Empty state tree information. This is serialized as an array for future proofing.
 #[derive(Default, Deserialize, Serialize)]

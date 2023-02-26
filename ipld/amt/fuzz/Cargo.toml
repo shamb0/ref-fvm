@@ -3,7 +3,7 @@ name = "ipld_amt_fuzz"
 version = "0.0.0"
 authors = ["ChainSafe Systems <info@chainsafe.io>", "Protocol Labs", "Filecoin Core Devs"]
 publish = false
-edition = "2018"
+edition = "2021"
 
 [package.metadata]
 cargo-fuzz = true
@@ -16,7 +16,6 @@ itertools = "0.10.3"
 
 cid = { version = "0.8.2", default-features = false, features = ["serde-codec", "arb", "std"] }
 fvm_ipld_amt = { path = ".."}
-fvm_shared = { path = "../../../shared" }
 fvm_ipld_blockstore = { path = "../../blockstore" }
 
 # Prevent this from interfering with workspaces

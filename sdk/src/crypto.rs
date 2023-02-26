@@ -1,5 +1,7 @@
+// Copyright 2021-2023 Protocol Labs
+// SPDX-License-Identifier: Apache-2.0, MIT
 use cid::Cid;
-use fvm_ipld_encoding::{to_vec, Cbor};
+use fvm_ipld_encoding::to_vec;
 use fvm_shared::address::Address;
 use fvm_shared::consensus::ConsensusFault;
 use fvm_shared::crypto::hash::SupportedHashes;
@@ -17,6 +19,8 @@ use num_traits::FromPrimitive;
 use crate::{status_code_to_bool, sys, SyscallResult};
 
 /// Verifies that a signature is valid for an address and plaintext.
+///
+/// NOTE: This only supports f1 and f3 addresses.
 pub fn verify_signature(
     signature: &Signature,
     signer: &Address,
@@ -66,13 +70,13 @@ pub fn hash_blake2b(data: &[u8]) -> [u8; 32] {
 }
 
 /// Hashes input data using one of the supported functions.
-pub fn hash(hasher: SupportedHashes, data: &[u8]) -> Vec<u8> {
-    // TODO, either this or ([u8; 64], usize)
+/// hashes longer than 64 bytes will be truncated.
+pub fn hash_owned(hasher: SupportedHashes, data: &[u8]) -> Vec<u8> {
     let mut ret = Vec::with_capacity(64);
 
     unsafe {
         let written = sys::crypto::hash(
-            hasher.into(),
+            hasher as u64,
             data.as_ptr(),
             data.len() as u32,
             ret.as_mut_ptr(),
@@ -86,6 +90,20 @@ pub fn hash(hasher: SupportedHashes, data: &[u8]) -> Vec<u8> {
     }
 
     ret
+}
+
+/// Hashes input data using one of the supported functions into a buffer.
+pub fn hash_into(hasher: SupportedHashes, data: &[u8], digest: &mut [u8]) -> usize {
+    unsafe {
+        sys::crypto::hash(
+            hasher as u64,
+            data.as_ptr(),
+            data.len() as u32,
+            digest.as_mut_ptr(),
+            digest.len() as u32,
+        )
+        .unwrap_or_else(|_| panic!("failed compute hash using {:?}", hasher)) as usize
+    }
 }
 
 /// Computes an unsealed sector CID (CommD) from its constituent piece CIDs (CommPs) and sizes.
@@ -116,17 +134,13 @@ pub fn compute_unsealed_sector_cid(
 
 /// Verifies a sector seal proof.
 pub fn verify_seal(info: &SealVerifyInfo) -> SyscallResult<bool> {
-    let info = info
-        .marshal_cbor()
-        .expect("failed to marshal seal verification input");
+    let info = to_vec(info).expect("failed to marshal seal verification input");
     unsafe { sys::crypto::verify_seal(info.as_ptr(), info.len() as u32).map(status_code_to_bool) }
 }
 
 /// Verifies a window proof of spacetime.
 pub fn verify_post(info: &WindowPoStVerifyInfo) -> SyscallResult<bool> {
-    let info = info
-        .marshal_cbor()
-        .expect("failed to marshal PoSt verification input");
+    let info = to_vec(info).expect("failed to marshal PoSt verification input");
     unsafe { sys::crypto::verify_post(info.as_ptr(), info.len() as u32).map(status_code_to_bool) }
 }
 
@@ -172,9 +186,7 @@ pub fn verify_consensus_fault(
 }
 
 pub fn verify_aggregate_seals(info: &AggregateSealVerifyProofAndInfos) -> SyscallResult<bool> {
-    let info = info
-        .marshal_cbor()
-        .expect("failed to marshal aggregate seal verification input");
+    let info = to_vec(info).expect("failed to marshal aggregate seal verification input");
     unsafe {
         sys::crypto::verify_aggregate_seals(info.as_ptr(), info.len() as u32)
             .map(status_code_to_bool)
@@ -182,9 +194,7 @@ pub fn verify_aggregate_seals(info: &AggregateSealVerifyProofAndInfos) -> Syscal
 }
 
 pub fn verify_replica_update(info: &ReplicaUpdateInfo) -> SyscallResult<bool> {
-    let info = info
-        .marshal_cbor()
-        .expect("failed to marshal replica update verification input");
+    let info = to_vec(info).expect("failed to marshal replica update verification input");
     unsafe {
         sys::crypto::verify_replica_update(info.as_ptr(), info.len() as u32)
             .map(status_code_to_bool)

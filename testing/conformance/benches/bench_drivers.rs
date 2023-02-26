@@ -1,13 +1,16 @@
+// Copyright 2021-2023 Protocol Labs
+// SPDX-License-Identifier: Apache-2.0, MIT
 extern crate criterion;
 
 use criterion::*;
+use fvm::engine::MultiEngine;
 use fvm::executor::{ApplyKind, DefaultExecutor, Executor};
-use fvm::machine::MultiEngine;
+use fvm::machine::Machine;
 use fvm_conformance_tests::driver::*;
 use fvm_conformance_tests::vector::{MessageVector, Variant};
 use fvm_conformance_tests::vm::{TestKernel, TestMachine};
 use fvm_ipld_blockstore::MemoryBlockstore;
-use fvm_ipld_encoding::Cbor;
+use fvm_ipld_encoding::from_slice;
 use fvm_shared::address::Protocol;
 use fvm_shared::crypto::signature::SECP_SIG_LEN;
 use fvm_shared::message::Message;
@@ -45,9 +48,21 @@ pub fn bench_vector_variant(
                 let vector = &(*vector).clone();
                 let bs = bs.clone();
                 // NOTE next few lines don't impact the benchmarks.
-                let machine = TestMachine::new_for_vector(vector, variant, bs, engines);
+                let machine =
+                    TestMachine::new_for_vector(vector, variant, bs, None, false, None).unwrap();
+                let engine = engines.get(&machine.context().network).unwrap();
+                // Preload the actors. We don't usually preload actors when testing, so we're going
+                // to do this explicitly.
+                engine
+                    .acquire()
+                    .preload(
+                        machine.blockstore(),
+                        machine.builtin_actors().builtin_actor_codes(),
+                    )
+                    .unwrap();
                 // can assume this works because it passed a test before this ran
-                let exec: DefaultExecutor<TestKernel> = DefaultExecutor::new(machine);
+                let exec: DefaultExecutor<TestKernel> =
+                    DefaultExecutor::new(engine, machine).unwrap();
                 (messages_with_lengths.clone(), exec)
             },
             |(messages, exec)| apply_messages(criterion::black_box(messages), exec),
@@ -91,14 +106,15 @@ pub fn bench_vector_file(
         // this tests the variant before we run the benchmark and record the bench results to disk.
         // if we broke the test, it's not a valid optimization :P
         let testresult = match check_strength {
-            CheckStrength::FullTest => run_variant(bs.clone(), vector, variant, engines, true)
-                .map_err(|e| {
-                    anyhow::anyhow!("run_variant failed (probably a test parsing bug): {}", e)
-                })?,
+            CheckStrength::FullTest => {
+                run_variant(bs.clone(), vector, variant, engines, true, None, None).map_err(
+                    |e| anyhow::anyhow!("run_variant failed (probably a test parsing bug): {}", e),
+                )?
+            }
             CheckStrength::OnlyCheckSuccess => {
-                run_variant(bs.clone(), vector, variant, engines, false).map_err(|e| {
-                    anyhow::anyhow!("run_variant failed (probably a test parsing bug): {}", e)
-                })?
+                run_variant(bs.clone(), vector, variant, engines, false, None, None).map_err(
+                    |e| anyhow::anyhow!("run_variant failed (probably a test parsing bug): {}", e),
+                )?
             }
             CheckStrength::NoChecks => VariantResult::Ok {
                 id: variant.id.clone(),
@@ -110,7 +126,7 @@ pub fn bench_vector_file(
                 .apply_messages
                 .iter()
                 .map(|m| {
-                    let unmarshalled = Message::unmarshal_cbor(&m.bytes).unwrap();
+                    let unmarshalled: Message = from_slice(&m.bytes).unwrap();
                     let mut raw_length = m.bytes.len();
                     if unmarshalled.from.protocol() == Protocol::Secp256k1 {
                         // 65 bytes signature + 1 byte type + 3 bytes for field info.

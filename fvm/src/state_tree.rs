@@ -1,8 +1,8 @@
+// Copyright 2021-2023 Protocol Labs
 // Copyright 2019-2022 ChainSafe Systems
 // SPDX-License-Identifier: Apache-2.0, MIT
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 
 use anyhow::{anyhow, Context as _};
 use cid::{multihash, Cid};
@@ -11,14 +11,17 @@ use fvm_ipld_encoding::tuple::*;
 use fvm_ipld_encoding::CborStore;
 use fvm_ipld_hamt::Hamt;
 use fvm_shared::address::{Address, Payload};
-use fvm_shared::bigint::bigint_ser;
 use fvm_shared::econ::TokenAmount;
 use fvm_shared::state::{StateInfo0, StateRoot, StateTreeVersion};
 use fvm_shared::{ActorID, HAMT_BIT_WIDTH};
+use num_traits::Zero;
+#[cfg(feature = "arb")]
+use quickcheck::Arbitrary;
 
+use crate::history_map::HistoryMap;
 use crate::init_actor::State as InitActorState;
-use crate::kernel::{ClassifyResult, Context as _, ExecutionError, Result};
-use crate::syscall_error;
+use crate::kernel::{ClassifyResult, ExecutionError, Result};
+use crate::{syscall_error, EMPTY_ARR_CID};
 
 /// State tree implementation using hamt. This structure is not threadsafe and should only be used
 /// in sync contexts.
@@ -28,171 +31,30 @@ pub struct StateTree<S> {
     version: StateTreeVersion,
     info: Option<Cid>,
 
-    /// State cache
-    snaps: StateSnapshots,
-}
-
-/// Collection of state snapshots
-struct StateSnapshots {
+    /// An actor-state cache that internally keeps an undo history.
+    actor_cache: RefCell<HistoryMap<ActorID, ActorCacheEntry>>,
+    /// An actor-address cache that internally keeps an undo history.
+    resolve_cache: RefCell<HistoryMap<Address, ActorID>>,
+    /// Snapshot layers. Each layer contains points in the actor/resolve cache histories to which
+    /// said caches will be reverted on revert.
     layers: Vec<StateSnapLayer>,
 }
 
-/// State snap shot layer
-#[derive(Debug, Default)]
+/// An entry in the actor cache.
+#[derive(Eq, PartialEq)]
+struct ActorCacheEntry {
+    /// True if this is a change that should be flushed.
+    dirty: bool,
+    /// The cached actor, or None if the actor doesn't exist and/or has been deleted.
+    actor: Option<ActorState>,
+}
+
+/// State snap shot layer.
 struct StateSnapLayer {
-    actors: RefCell<HashMap<ActorID, Option<ActorState>>>,
-    resolve_cache: RefCell<HashMap<Address, ActorID>>,
-}
-
-#[allow(clippy::large_enum_variant)]
-enum StateCacheResult {
-    Uncached,
-    Exists(ActorState),
-    Deleted,
-}
-
-impl StateSnapshots {
-    /// State snapshot constructor
-    fn new() -> Self {
-        Self {
-            layers: vec![StateSnapLayer::default()],
-        }
-    }
-
-    fn add_layer(&mut self) {
-        self.layers.push(StateSnapLayer::default())
-    }
-
-    fn drop_layer(&mut self) -> Result<()> {
-        self.layers
-            .pop()
-            .with_context(|| {
-                format!(
-                    "drop layer failed to index snapshot layer at index {}",
-                    &self.layers.len() - 1
-                )
-            })
-            .or_fatal()?;
-
-        Ok(())
-    }
-
-    fn merge_last_layer(&mut self) -> Result<()> {
-        self.layers
-            .get(&self.layers.len() - 2)
-            .with_context(|| {
-                format!(
-                    "merging layers failed to index snapshot layer at index: {}",
-                    &self.layers.len() - 2
-                )
-            })
-            .or_fatal()?
-            .actors
-            .borrow_mut()
-            .extend(
-                self.layers[&self.layers.len() - 1]
-                    .actors
-                    .borrow_mut()
-                    .drain(),
-            );
-
-        self.layers
-            .get(&self.layers.len() - 2)
-            .with_context(|| {
-                format!(
-                    "merging layers failed to index snapshot layer at index: {}",
-                    &self.layers.len() - 2
-                )
-            })
-            .or_fatal()?
-            .resolve_cache
-            .borrow_mut()
-            .extend(
-                self.layers[&self.layers.len() - 1]
-                    .resolve_cache
-                    .borrow_mut()
-                    .drain(),
-            );
-
-        self.drop_layer()
-    }
-
-    fn resolve_address(&self, addr: &Address) -> Option<ActorID> {
-        if let &Payload::ID(id) = addr.payload() {
-            return Some(id);
-        }
-        for layer in self.layers.iter().rev() {
-            if let Some(res_addr) = layer.resolve_cache.borrow().get(addr).cloned() {
-                return Some(res_addr);
-            }
-        }
-
-        None
-    }
-
-    fn cache_resolve_address(&self, addr: Address, id: ActorID) -> Result<()> {
-        self.layers
-            .last()
-            .with_context(|| {
-                format!(
-                    "caching address failed to index snapshot layer at index: {}",
-                    &self.layers.len() - 1
-                )
-            })
-            .or_fatal()?
-            .resolve_cache
-            .borrow_mut()
-            .insert(addr, id);
-
-        Ok(())
-    }
-
-    /// Returns the actor if present in the snapshots.
-    fn get_actor(&self, id: ActorID) -> StateCacheResult {
-        for layer in self.layers.iter().rev() {
-            if let Some(state) = layer.actors.borrow().get(&id) {
-                return state
-                    .clone()
-                    .map(StateCacheResult::Exists)
-                    .unwrap_or(StateCacheResult::Deleted);
-            }
-        }
-
-        StateCacheResult::Uncached
-    }
-
-    fn set_actor(&self, id: ActorID, actor: ActorState) -> Result<()> {
-        self.layers
-            .last()
-            .with_context(|| {
-                format!(
-                    "set actor failed to index snapshot layer at index: {}",
-                    &self.layers.len() - 1
-                )
-            })
-            .or_fatal()?
-            .actors
-            .borrow_mut()
-            .insert(id, Some(actor));
-        Ok(())
-    }
-
-    fn delete_actor(&self, id: ActorID) -> Result<()> {
-        self.layers
-            .last()
-            .with_context(|| {
-                format!(
-                    "delete actor failed to index snapshot layer at index: {}",
-                    &self.layers.len() - 1
-                )
-            })
-            .or_fatal()?
-            .actors
-            .borrow_mut()
-            .insert(id, None);
-
-        Ok(())
-    }
+    /// The actor-cache height at which this snapshot was taken.
+    actor_cache_height: usize,
+    /// The resolve-cache height at which this snapshot was taken.
+    resolve_cache_height: usize,
 }
 
 impl<S> StateTree<S>
@@ -201,13 +63,17 @@ where
 {
     pub fn new(store: S, version: StateTreeVersion) -> Result<Self> {
         let info = match version {
-            StateTreeVersion::V0 | StateTreeVersion::V1 | StateTreeVersion::V2 => {
+            StateTreeVersion::V0
+            | StateTreeVersion::V1
+            | StateTreeVersion::V2
+            | StateTreeVersion::V3
+            | StateTreeVersion::V4 => {
                 return Err(ExecutionError::Fatal(anyhow!(
                     "unsupported state tree version: {:?}",
                     version
                 )))
             }
-            StateTreeVersion::V3 | StateTreeVersion::V4 => {
+            StateTreeVersion::V5 => {
                 let cid = store
                     .put_cbor(&StateInfo0::default(), multihash::Code::Blake2b256)
                     .context("failed to put state info")
@@ -222,7 +88,9 @@ where
             hamt,
             version,
             info,
-            snaps: StateSnapshots::new(),
+            actor_cache: Default::default(),
+            resolve_cache: Default::default(),
+            layers: Vec::new(),
         })
     }
 
@@ -251,13 +119,16 @@ where
         };
 
         match version {
-            StateTreeVersion::V0 | StateTreeVersion::V1 | StateTreeVersion::V2 => {
-                return Err(ExecutionError::Fatal(anyhow!(
-                    "unsupported state tree version: {:?}",
-                    version
-                )))
-            }
-            StateTreeVersion::V3 | StateTreeVersion::V4 => {
+            StateTreeVersion::V0
+            | StateTreeVersion::V1
+            | StateTreeVersion::V2
+            | StateTreeVersion::V3
+            | StateTreeVersion::V4 => Err(ExecutionError::Fatal(anyhow!(
+                "unsupported state tree version: {:?}",
+                version
+            ))),
+
+            StateTreeVersion::V5 => {
                 let hamt = Hamt::load_with_bit_width(&actors, store, HAMT_BIT_WIDTH)
                     .context("failed to load state tree")
                     .or_fatal()?;
@@ -266,7 +137,9 @@ where
                     hamt,
                     version,
                     info,
-                    snaps: StateSnapshots::new(),
+                    actor_cache: Default::default(),
+                    resolve_cache: Default::default(),
+                    layers: Vec::new(),
                 })
             }
         }
@@ -278,53 +151,44 @@ where
     }
 
     /// Get actor state from an address. Will be resolved to ID address.
-    pub fn get_actor(&self, addr: &Address) -> Result<Option<ActorState>> {
+    #[cfg(feature = "testing")]
+    pub fn get_actor_by_address(&self, addr: &Address) -> Result<Option<ActorState>> {
         let id = match self.lookup_id(addr)? {
             Some(id) => id,
             None => return Ok(None),
         };
-        self.get_actor_id(id)
+        self.get_actor(id)
     }
 
     /// Get actor state from an actor ID.
-    pub fn get_actor_id(&self, id: ActorID) -> Result<Option<ActorState>> {
-        // Check cache for actor state
-        Ok(match self.snaps.get_actor(id) {
-            StateCacheResult::Exists(state) => Some(state),
-            StateCacheResult::Deleted => None,
-            StateCacheResult::Uncached => {
-                // if state doesn't exist, find using hamt
+    pub fn get_actor(&self, id: ActorID) -> Result<Option<ActorState>> {
+        self.actor_cache
+            .borrow_mut()
+            .get_or_try_insert_with(id, || {
+                // It's not cached/dirty, so we look it up and cache it.
                 let key = Address::new_id(id).to_bytes();
-                let act = self
-                    .hamt
-                    .get(&key)
-                    .with_context(|| format!("failed to lookup actor {}", id))
-                    .or_fatal()?
-                    .cloned();
-
-                // Update cache if state was found
-                if let Some(act_s) = &act {
-                    self.snaps.set_actor(id, act_s.clone())?;
-                }
-
-                act
-            }
-        })
-    }
-
-    /// Set actor state for an address. Will set state at ID address.
-    pub fn set_actor(&mut self, addr: &Address, actor: ActorState) -> Result<()> {
-        let id = self
-            .lookup_id(addr)?
-            .with_context(|| format!("Resolution lookup failed for {}", addr))
-            .or_fatal()?;
-
-        self.set_actor_id(id, actor)
+                Ok(ActorCacheEntry {
+                    dirty: false,
+                    actor: self
+                        .hamt
+                        .get(&key)
+                        .with_context(|| format!("failed to lookup actor {}", id))
+                        .or_fatal()?
+                        .cloned(),
+                })
+            })
+            .map(|ActorCacheEntry { actor, .. }| actor.clone())
     }
 
     /// Set actor state with an actor ID.
-    pub fn set_actor_id(&mut self, id: ActorID, actor: ActorState) -> Result<()> {
-        self.snaps.set_actor(id, actor)
+    pub fn set_actor(&mut self, id: ActorID, actor: ActorState) {
+        self.actor_cache.borrow_mut().insert(
+            id,
+            ActorCacheEntry {
+                actor: Some(actor),
+                dirty: true,
+            },
+        )
     }
 
     /// Get an ID address from any Address
@@ -333,61 +197,37 @@ where
             return Ok(Some(id));
         }
 
-        if let Some(res_address) = self.snaps.resolve_address(addr) {
+        if let Some(&res_address) = self.resolve_cache.borrow().get(addr) {
             return Ok(Some(res_address));
         }
 
         let (state, _) = InitActorState::load(self)?;
 
-        let a = match state
-            .resolve_address(self.store(), addr)
-            .context("Could not resolve address")
-            .or_fatal()?
-        {
+        let a = match state.resolve_address(self.store(), addr)? {
             Some(a) => a,
             None => return Ok(None),
         };
 
-        self.snaps.cache_resolve_address(*addr, a)?;
+        self.resolve_cache.borrow_mut().insert(*addr, a);
 
         Ok(Some(a))
     }
 
-    /// Delete actor for an address. Will resolve to ID address to delete.
-    pub fn delete_actor(&mut self, addr: &Address) -> Result<()> {
-        let id = self
-            .lookup_id(addr)?
-            .with_context(|| format!("Resolution lookup failed for {}", addr))
-            .or_fatal()?;
-
-        self.delete_actor_id(id)
-    }
-
-    /// Delete actor identified by the supplied ID. Returns no error if the actor doesn't exist.
-    pub fn delete_actor_id(&mut self, id: ActorID) -> Result<()> {
-        // Remove value from cache
-        self.snaps.delete_actor(id)?;
-
-        Ok(())
-    }
-
-    /// Mutate and set actor state for an Address. Returns false if the actor did not exist. Returns
-    /// a fatal error if the actor doesn't exist.
-    pub fn mutate_actor<F>(&mut self, addr: &Address, mutate: F) -> Result<()>
-    where
-        F: FnOnce(&mut ActorState) -> Result<()>,
-    {
-        let id = match self.lookup_id(addr)? {
-            Some(id) => id,
-            None => return Err(anyhow!("failed to lookup actor {}", addr)).or_fatal(),
-        };
-
-        self.mutate_actor_id(id, mutate)
+    /// Delete actor identified by the supplied ID.
+    pub fn delete_actor(&mut self, id: ActorID) {
+        // Record that we've deleted the actor.
+        self.actor_cache.borrow_mut().insert(
+            id,
+            ActorCacheEntry {
+                dirty: true,
+                actor: None,
+            },
+        );
     }
 
     /// Mutate and set actor state identified by the supplied ID. Returns a fatal error if the actor
     /// doesn't exist.
-    pub fn mutate_actor_id<F>(&mut self, id: ActorID, mutate: F) -> Result<()>
+    pub fn mutate_actor<F>(&mut self, id: ActorID, mutate: F) -> Result<()>
     where
         F: FnOnce(&mut ActorState) -> Result<()>,
     {
@@ -407,7 +247,7 @@ where
         F: FnOnce(&mut ActorState) -> Result<()>,
     {
         // Retrieve actor state from address
-        let mut act = match self.get_actor_id(id)? {
+        let mut act = match self.get_actor(id)? {
             Some(act) => act,
             None => return Ok(false),
         };
@@ -415,7 +255,7 @@ where
         // Apply function of actor state
         mutate(&mut act)?;
         // Set the actor
-        self.set_actor_id(id, act)?;
+        self.set_actor(id, act);
         Ok(true)
     }
 
@@ -423,7 +263,7 @@ where
     pub fn register_new_address(&mut self, addr: &Address) -> Result<ActorID> {
         let (mut state, mut actor) = InitActorState::load(self)?;
 
-        let new_addr = state.map_address_to_new_id(self.store(), addr)?;
+        let new_id = state.map_address_to_new_id(self.store(), addr)?;
 
         // Set state for init actor in store and update root Cid
         actor.state = self
@@ -431,37 +271,62 @@ where
             .put_cbor(&state, multihash::Code::Blake2b256)
             .or_fatal()?;
 
-        self.set_actor(&crate::init_actor::INIT_ACTOR_ADDR, actor)?;
+        self.set_actor(crate::init_actor::INIT_ACTOR_ID, actor);
+        self.resolve_cache.borrow_mut().insert(*addr, new_id);
 
-        Ok(new_addr)
+        Ok(new_id)
     }
 
     /// Begin a new state transaction. Transactions stack.
     pub fn begin_transaction(&mut self) {
-        self.snaps.add_layer();
+        self.layers.push(StateSnapLayer {
+            actor_cache_height: self.actor_cache.get_mut().history_len(),
+            resolve_cache_height: self.resolve_cache.get_mut().history_len(),
+        })
     }
 
     /// End a transaction, reverting if requested.
     pub fn end_transaction(&mut self, revert: bool) -> Result<()> {
+        let layer = self
+            .layers
+            .pop()
+            .context("state snapshots empty")
+            .or_fatal()?;
         if revert {
-            self.snaps.drop_layer()
-        } else {
-            self.snaps.merge_last_layer()
+            self.actor_cache
+                .get_mut()
+                .rollback(layer.actor_cache_height);
+            self.resolve_cache
+                .get_mut()
+                .rollback(layer.resolve_cache_height);
         }
+        // When we end the last transaction, discard the undo history.
+        if !self.in_transaction() {
+            self.actor_cache.get_mut().discard_history();
+            self.resolve_cache.get_mut().discard_history();
+        }
+        Ok(())
+    }
+
+    /// Returns true if we're inside of a transaction.
+    pub fn in_transaction(&self) -> bool {
+        !self.layers.is_empty()
     }
 
     /// Flush state tree and return Cid root.
     pub fn flush(&mut self) -> Result<Cid> {
-        if self.snaps.layers.len() != 1 {
+        if self.in_transaction() {
             return Err(ExecutionError::Fatal(anyhow!(
-                "tried to flush state tree with snapshots on the stack: {:?}",
-                self.snaps.layers.len()
+                "cannot flush while inside of a transaction",
             )));
         }
-
-        for (&id, sto) in self.snaps.layers[0].actors.borrow().iter() {
+        for (&id, entry) in self.actor_cache.get_mut().iter_mut() {
+            if !entry.dirty {
+                continue;
+            }
+            entry.dirty = false;
             let addr = Address::new_id(id);
-            match sto {
+            match entry.actor {
                 None => {
                     self.hamt.delete(&addr.to_bytes()).or_fatal()?;
                 }
@@ -522,22 +387,54 @@ pub struct ActorState {
     /// Sequence of the actor.
     pub sequence: u64,
     /// Tokens available to the actor.
-    #[serde(with = "bigint_ser")]
     pub balance: TokenAmount,
+    /// The actor's "delegated" address, if assigned.
+    ///
+    /// This field is set on actor creation and never modified.
+    pub delegated_address: Option<Address>,
 }
 
 impl ActorState {
     /// Constructor for actor state
-    pub fn new(code: Cid, state: Cid, balance: TokenAmount, sequence: u64) -> Self {
+    pub fn new(
+        code: Cid,
+        state: Cid,
+        balance: TokenAmount,
+        sequence: u64,
+        address: Option<Address>,
+    ) -> Self {
         Self {
             code,
             state,
             sequence,
             balance,
+            delegated_address: address,
         }
     }
+
+    /// Construct a new empty actor with the specified code.
+    pub fn new_empty(code: Cid, delegated_address: Option<Address>) -> Self {
+        ActorState {
+            code,
+            state: *EMPTY_ARR_CID,
+            sequence: 0,
+            balance: TokenAmount::zero(),
+            delegated_address,
+        }
+    }
+
     /// Safely deducts funds from an Actor
     pub fn deduct_funds(&mut self, amt: &TokenAmount) -> Result<()> {
+        log::info!(
+            "Self Balance :: {:#?}",
+            primitive_types::U256::from_dec_str(&format!("{}", &self.balance.atto())).unwrap()
+        );
+
+        log::info!(
+            "Deduct Amt :: {:#?}",
+            primitive_types::U256::from_dec_str(&format!("{}", &amt.atto())).unwrap()
+        );
+
         if &self.balance < amt {
             return Err(
                 syscall_error!(InsufficientFunds; "when deducting funds ({}) from balance ({})", amt, self.balance).into(),
@@ -550,6 +447,23 @@ impl ActorState {
     /// Deposits funds to an Actor
     pub fn deposit_funds(&mut self, amt: &TokenAmount) {
         self.balance += amt;
+    }
+}
+
+#[cfg(feature = "arb")]
+impl Arbitrary for ActorState {
+    fn arbitrary(g: &mut quickcheck::Gen) -> Self {
+        let cid = Cid::new_v1(
+            u64::arbitrary(g),
+            cid::multihash::Multihash::wrap(u64::arbitrary(g), &[u8::arbitrary(g)]).unwrap(),
+        );
+        Self {
+            code: cid,
+            state: cid,
+            sequence: u64::arbitrary(g),
+            balance: TokenAmount::from_atto(u64::arbitrary(g)),
+            address: None,
+        }
     }
 }
 
@@ -640,13 +554,13 @@ mod tests {
     use fvm_ipld_blockstore::MemoryBlockstore;
     use fvm_ipld_encoding::{CborStore, DAG_CBOR};
     use fvm_shared::address::{Address, SECP_PUB_LEN};
-    use fvm_shared::bigint::BigInt;
+    use fvm_shared::econ::TokenAmount;
     use fvm_shared::state::StateTreeVersion;
-    use fvm_shared::{IDENTITY_HASH, IPLD_RAW};
+    use fvm_shared::{ActorID, IDENTITY_HASH, IPLD_RAW};
     use lazy_static::lazy_static;
 
     use crate::init_actor;
-    use crate::init_actor::INIT_ACTOR_ADDR;
+    use crate::init_actor::INIT_ACTOR_ID;
     use crate::state_tree::{ActorState, StateTree};
 
     lazy_static! {
@@ -666,41 +580,41 @@ mod tests {
 
     #[test]
     fn get_set_cache() {
-        let act_s = ActorState::new(empty_cid(), empty_cid(), Default::default(), 1);
-        let act_a = ActorState::new(empty_cid(), empty_cid(), Default::default(), 2);
-        let addr = Address::new_id(1);
+        let act_s = ActorState::new(empty_cid(), empty_cid(), Default::default(), 1, None);
+        let act_a = ActorState::new(empty_cid(), empty_cid(), Default::default(), 2, None);
+        let actor_id = 1;
         let store = MemoryBlockstore::default();
-        let mut tree = StateTree::new(&store, StateTreeVersion::V3).unwrap();
+        let mut tree = StateTree::new(&store, StateTreeVersion::V5).unwrap();
 
         // test address not in cache
-        assert_eq!(tree.get_actor(&addr).unwrap(), None);
+        assert_eq!(tree.get_actor(actor_id).unwrap(), None);
         // test successful insert
-        assert!(tree.set_actor(&addr, act_s).is_ok());
+        tree.set_actor(actor_id, act_s);
         // test inserting with different data
-        assert!(tree.set_actor(&addr, act_a.clone()).is_ok());
-        // Assert insert with same data returns ok
-        assert!(tree.set_actor(&addr, act_a.clone()).is_ok());
+        tree.set_actor(actor_id, act_a.clone());
+        // Assert insert with same data works
+        tree.set_actor(actor_id, act_a.clone());
         // test getting set item
-        assert_eq!(tree.get_actor(&addr).unwrap().unwrap(), act_a);
+        assert_eq!(tree.get_actor(actor_id).unwrap().unwrap(), act_a);
     }
 
     #[test]
     fn delete_actor() {
         let store = MemoryBlockstore::default();
-        let mut tree = StateTree::new(&store, StateTreeVersion::V3).unwrap();
+        let mut tree = StateTree::new(&store, StateTreeVersion::V5).unwrap();
 
-        let addr = Address::new_id(3);
-        let act_s = ActorState::new(empty_cid(), empty_cid(), Default::default(), 1);
-        tree.set_actor(&addr, act_s.clone()).unwrap();
-        assert_eq!(tree.get_actor(&addr).unwrap(), Some(act_s));
-        tree.delete_actor(&addr).unwrap();
-        assert_eq!(tree.get_actor(&addr).unwrap(), None);
+        let actor_id = 3;
+        let act_s = ActorState::new(empty_cid(), empty_cid(), Default::default(), 1, None);
+        tree.set_actor(actor_id, act_s.clone());
+        assert_eq!(tree.get_actor(actor_id).unwrap(), Some(act_s));
+        tree.delete_actor(actor_id);
+        assert_eq!(tree.get_actor(actor_id).unwrap(), None);
     }
 
     #[test]
     fn get_set_non_id() {
         let store = MemoryBlockstore::default();
-        let mut tree = StateTree::new(&store, StateTreeVersion::V3).unwrap();
+        let mut tree = StateTree::new(&store, StateTreeVersion::V5).unwrap();
         let init_state = init_actor::State::new_test(&store);
 
         let state_cid = tree
@@ -709,25 +623,32 @@ mod tests {
             .map_err(|e| e.to_string())
             .unwrap();
 
-        let act_s = ActorState::new(*DUMMY_INIT_ACTOR_CODE_ID, state_cid, Default::default(), 1);
+        let act_s = ActorState::new(
+            *DUMMY_INIT_ACTOR_CODE_ID,
+            state_cid,
+            Default::default(),
+            1,
+            None,
+        );
 
         tree.begin_transaction();
-        tree.set_actor(&INIT_ACTOR_ADDR, act_s).unwrap();
+        tree.set_actor(INIT_ACTOR_ID, act_s);
 
         // Test mutate function
-        tree.mutate_actor(&INIT_ACTOR_ADDR, |mut actor| {
+        tree.mutate_actor(INIT_ACTOR_ID, |mut actor| {
             actor.sequence = 2;
             Ok(())
         })
         .unwrap();
-        let new_init_s = tree.get_actor(&INIT_ACTOR_ADDR).unwrap();
+        let new_init_s = tree.get_actor(INIT_ACTOR_ID).unwrap();
         assert_eq!(
             new_init_s,
             Some(ActorState {
                 code: *DUMMY_INIT_ACTOR_CODE_ID,
                 state: state_cid,
                 balance: Default::default(),
-                sequence: 2
+                sequence: 2,
+                delegated_address: None
             })
         );
 
@@ -741,75 +662,74 @@ mod tests {
     #[test]
     fn test_transactions() {
         let store = MemoryBlockstore::default();
-        let mut tree = StateTree::new(&store, StateTreeVersion::V3).unwrap();
-        let mut addresses: Vec<Address> = Vec::new();
+        let mut tree = StateTree::new(&store, StateTreeVersion::V5).unwrap();
 
-        let test_addresses = vec!["t0100", "t0101", "t0102"];
-        for a in test_addresses.iter() {
-            addresses.push(a.parse().unwrap());
-        }
+        let addresses: &[ActorID] = &[101, 102, 103];
 
         tree.begin_transaction();
         tree.set_actor(
-            &addresses[0],
+            addresses[0],
             ActorState::new(
                 *DUMMY_ACCOUNT_ACTOR_CODE_ID,
                 *DUMMY_ACCOUNT_ACTOR_CODE_ID,
-                BigInt::from(55),
+                TokenAmount::from_atto(55),
                 1,
+                None,
             ),
-        )
-        .unwrap();
+        );
 
         tree.set_actor(
-            &addresses[1],
+            addresses[1],
             ActorState::new(
                 *DUMMY_ACCOUNT_ACTOR_CODE_ID,
                 *DUMMY_ACCOUNT_ACTOR_CODE_ID,
-                BigInt::from(55),
+                TokenAmount::from_atto(55),
                 1,
+                None,
             ),
-        )
-        .unwrap();
+        );
         tree.set_actor(
-            &addresses[2],
+            addresses[2],
             ActorState::new(
                 *DUMMY_ACCOUNT_ACTOR_CODE_ID,
                 *DUMMY_ACCOUNT_ACTOR_CODE_ID,
-                BigInt::from(55),
+                TokenAmount::from_atto(55),
                 1,
+                None,
             ),
-        )
-        .unwrap();
+        );
         tree.end_transaction(false).unwrap();
         tree.flush().unwrap();
 
         assert_eq!(
-            tree.get_actor(&addresses[0]).unwrap().unwrap(),
+            tree.get_actor(addresses[0]).unwrap().unwrap(),
             ActorState::new(
                 *DUMMY_ACCOUNT_ACTOR_CODE_ID,
                 *DUMMY_ACCOUNT_ACTOR_CODE_ID,
-                BigInt::from(55),
-                1
+                TokenAmount::from_atto(55),
+                1,
+                None,
             )
         );
         assert_eq!(
-            tree.get_actor(&addresses[1]).unwrap().unwrap(),
+            tree.get_actor(addresses[1]).unwrap().unwrap(),
             ActorState::new(
                 *DUMMY_ACCOUNT_ACTOR_CODE_ID,
                 *DUMMY_ACCOUNT_ACTOR_CODE_ID,
-                BigInt::from(55),
-                1
+                TokenAmount::from_atto(55),
+                1,
+                None,
             )
         );
 
         assert_eq!(
-            tree.get_actor(&addresses[2]).unwrap().unwrap(),
+            tree.get_actor(addresses[2]).unwrap().unwrap(),
             ActorState::new(
                 *DUMMY_ACCOUNT_ACTOR_CODE_ID,
                 *DUMMY_ACCOUNT_ACTOR_CODE_ID,
-                BigInt::from(55),
-                1
+                TokenAmount::from_atto(55),
+                1,
+                None
             )
         );
     }
@@ -817,27 +737,26 @@ mod tests {
     #[test]
     fn revert_transaction() {
         let store = MemoryBlockstore::default();
-        let mut tree = StateTree::new(&store, StateTreeVersion::V3).unwrap();
+        let mut tree = StateTree::new(&store, StateTreeVersion::V5).unwrap();
 
-        let addr_str = "f01";
-        let addr: Address = addr_str.parse().unwrap();
+        let actor_id: ActorID = 1;
 
         tree.begin_transaction();
         tree.set_actor(
-            &addr,
+            actor_id,
             ActorState::new(
                 *DUMMY_ACCOUNT_ACTOR_CODE_ID,
                 *DUMMY_ACCOUNT_ACTOR_CODE_ID,
-                BigInt::from(55),
+                TokenAmount::from_atto(55),
                 1,
+                None,
             ),
-        )
-        .unwrap();
+        );
         tree.end_transaction(true).unwrap();
 
         tree.flush().unwrap();
 
-        assert_eq!(tree.get_actor(&addr).unwrap(), None);
+        assert_eq!(tree.get_actor(actor_id).unwrap(), None);
     }
 
     #[test]
@@ -846,6 +765,8 @@ mod tests {
             StateTreeVersion::V0,
             StateTreeVersion::V1,
             StateTreeVersion::V2,
+            StateTreeVersion::V3,
+            StateTreeVersion::V4,
         ];
         let store = MemoryBlockstore::default();
         for v in unsupported {

@@ -1,8 +1,10 @@
+// Copyright 2021-2023 Protocol Labs
 // Copyright 2019-2022 ChainSafe Systems
 // SPDX-License-Identifier: Apache-2.0, MIT
 
 use std::borrow::Cow;
 
+use fvm_ipld_encoding::strict_bytes;
 use num_bigint::BigUint;
 use serde::{Deserialize, Serialize};
 
@@ -36,19 +38,19 @@ where
     }
 
     // Serialize as bytes
-    serde_bytes::Serialize::serialize(&bz, serializer)
+    strict_bytes::Serialize::serialize(&bz, serializer)
 }
 
 pub fn deserialize<'de, D>(deserializer: D) -> Result<BigUint, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let bz: Cow<'de, [u8]> = serde_bytes::Deserialize::deserialize(deserializer)?;
+    let bz: Cow<'de, [u8]> = strict_bytes::Deserialize::deserialize(deserializer)?;
     if bz.is_empty() {
         return Ok(BigUint::default());
     }
 
-    if bz.get(0) != Some(&0) {
+    if bz.first() != Some(&0) {
         return Err(serde::de::Error::custom(
             "First byte must be 0 to decode as BigUint",
         ));
@@ -86,7 +88,7 @@ mod tests {
         let bad_bytes = {
             let mut source = bad1.to_bytes_be();
             source.insert(0, 0);
-            to_vec(&serde_bytes::Bytes::new(&source)).unwrap()
+            to_vec(&strict_bytes::ByteBuf(source)).unwrap()
         };
 
         let res: Result<BigUintDe, _> = from_slice(&bad_bytes);

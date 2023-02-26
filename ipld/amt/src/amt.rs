@@ -1,3 +1,4 @@
+// Copyright 2021-2023 Protocol Labs
 // Copyright 2019-2022 ChainSafe Systems
 // SPDX-License-Identifier: Apache-2.0, MIT
 
@@ -7,14 +8,26 @@ use cid::Cid;
 use fvm_ipld_blockstore::Blockstore;
 use fvm_ipld_encoding::de::DeserializeOwned;
 use fvm_ipld_encoding::ser::Serialize;
+use fvm_ipld_encoding::serde::Deserialize;
 use fvm_ipld_encoding::CborStore;
 use itertools::sorted;
 
 use super::ValueMut;
 use crate::node::{CollapsedNode, Link};
+use crate::root::version::{Version as AmtVersion, V0, V3};
+use crate::root::RootImpl;
 use crate::{
-    init_sized_vec, nodes_for_height, Error, Node, Root, DEFAULT_BIT_WIDTH, MAX_HEIGHT, MAX_INDEX,
+    init_sized_vec, nodes_for_height, Error, Node, DEFAULT_BIT_WIDTH, MAX_HEIGHT, MAX_INDEX,
 };
+
+#[derive(Debug)]
+#[doc(hidden)]
+pub struct AmtImpl<V, BS, Ver> {
+    root: RootImpl<V, Ver>,
+    block_store: BS,
+    /// Remember the last flushed CID until it changes.
+    flushed_cid: Option<Cid>,
+}
 
 /// Array Mapped Trie allows for the insertion and persistence of data, serializable to a CID.
 ///
@@ -37,53 +50,36 @@ use crate::{
 /// // Generate cid by calling flush to remove cache
 /// let cid = amt.flush().unwrap();
 /// ```
-#[derive(Debug)]
-pub struct Amt<V, BS> {
-    root: Root<V>,
-    block_store: BS,
-}
+pub type Amt<V, BS> = AmtImpl<V, BS, V3>;
+/// Legacy amt V0
+pub type Amtv0<V, BS> = AmtImpl<V, BS, V0>;
 
-impl<V: PartialEq, BS: Blockstore> PartialEq for Amt<V, BS> {
+impl<V: PartialEq, BS: Blockstore, Ver: PartialEq> PartialEq for AmtImpl<V, BS, Ver> {
     fn eq(&self, other: &Self) -> bool {
         self.root == other.root
     }
 }
 
-impl<V, BS> Amt<V, BS>
+impl<V, BS, Ver> AmtImpl<V, BS, Ver>
 where
-    V: DeserializeOwned + Serialize,
-    BS: Blockstore,
+    Ver: AmtVersion,
 {
     /// Constructor for Root AMT node
     pub fn new(block_store: BS) -> Self {
         Self::new_with_bit_width(block_store, DEFAULT_BIT_WIDTH)
     }
 
-    /// Construct new Amt with given bit width.
+    /// Construct new Amt with given bit width
     pub fn new_with_bit_width(block_store: BS, bit_width: u32) -> Self {
         Self {
-            root: Root::new(bit_width),
+            root: RootImpl::new_with_bit_width(bit_width),
             block_store,
+            flushed_cid: None,
         }
     }
 
     fn bit_width(&self) -> u32 {
         self.root.bit_width
-    }
-
-    /// Constructs an AMT with a blockstore and a Cid of the root of the AMT
-    pub fn load(cid: &Cid, block_store: BS) -> Result<Self, Error> {
-        // Load root bytes from database
-        let root: Root<V> = block_store
-            .get_cbor(cid)?
-            .ok_or_else(|| Error::CidNotFound(cid.to_string()))?;
-
-        // Sanity check, this should never be possible.
-        if root.height > MAX_HEIGHT {
-            return Err(Error::MaxHeight(root.height, MAX_HEIGHT));
-        }
-
-        Ok(Self { root, block_store })
     }
 
     /// Gets the height of the `Amt`.
@@ -95,14 +91,76 @@ where
     pub fn count(&self) -> u64 {
         self.root.count
     }
+}
 
-    /// Generates an AMT with block store and array of cbor marshallable objects and returns Cid
+impl<V, BS, Ver> AmtImpl<V, BS, Ver>
+where
+    Ver: AmtVersion,
+    BS: Blockstore,
+    V: Serialize,
+{
+    /// Generates an AMT from an array of serializable objects.
+    ///
+    /// This can be called with an iterator of _references_ to values to avoid copying.
     pub fn new_from_iter(block_store: BS, vals: impl IntoIterator<Item = V>) -> Result<Cid, Error> {
-        let mut t = Self::new(block_store);
+        Self::new_from_iter_with_bit_width(block_store, DEFAULT_BIT_WIDTH, vals)
+    }
 
-        t.batch_set(vals)?;
+    /// Generates an AMT with the requested bitwidth from an array of serializable objects.
+    ///
+    /// This can be called with an iterator of _references_ to values to avoid copying.
+    pub fn new_from_iter_with_bit_width(
+        block_store: BS,
+        bit_width: u32,
+        vals: impl IntoIterator<Item = V>,
+    ) -> Result<Cid, Error> {
+        #[derive(serde::Serialize)]
+        #[serde(transparent)]
+        struct FakeDeserialize<V>(V);
+
+        impl<'de, V> Deserialize<'de> for FakeDeserialize<V> {
+            fn deserialize<D>(_: D) -> Result<Self, D::Error>
+            where
+                D: fvm_ipld_encoding::serde_bytes::Deserializer<'de>,
+            {
+                use serde::de::Error;
+                Err(D::Error::custom(
+                    "can't deserialize when constructing an AMT from an iterator",
+                ))
+            }
+        }
+
+        let mut t = AmtImpl::<_, BS, Ver>::new_with_bit_width(block_store, bit_width);
+
+        t.batch_set(vals.into_iter().map(FakeDeserialize))?;
 
         t.flush()
+    }
+}
+
+impl<V, BS, Ver> AmtImpl<V, BS, Ver>
+where
+    V: DeserializeOwned + Serialize,
+    BS: Blockstore,
+    Ver: AmtVersion,
+{
+    /// Constructs an AMT with a blockstore and a Cid of the root of the AMT
+    pub fn load(cid: &Cid, block_store: BS) -> Result<Self, Error> {
+        // Load root bytes from database
+        let root: RootImpl<V, Ver> = block_store
+            .get_cbor(cid)?
+            .ok_or_else(|| Error::CidNotFound(cid.to_string()))?;
+
+        // Sanity check, this should never be possible.
+        if root.height > MAX_HEIGHT {
+            return Err(Error::MaxHeight(root.height, MAX_HEIGHT));
+        }
+
+        Ok(Self {
+            root,
+            block_store,
+            flushed_cid: Some(*cid),
+        })
     }
 
     /// Get value at index of AMT
@@ -158,6 +216,9 @@ where
             self.root.count += 1;
         }
 
+        // There's no equality constraint on `V` so we could check if the content changed.
+        self.flushed_cid = None;
+
         Ok(())
     }
 
@@ -192,6 +253,7 @@ where
             return Ok(None);
         }
 
+        self.flushed_cid = None;
         self.root.count -= 1;
 
         if self.root.node.is_empty() {
@@ -260,8 +322,13 @@ where
 
     /// flush root and return Cid used as key in block store
     pub fn flush(&mut self) -> Result<Cid, Error> {
+        if let Some(cid) = self.flushed_cid {
+            return Ok(cid);
+        }
         self.root.node.flush(&self.block_store)?;
-        Ok(self.block_store.put_cbor(&self.root, Code::Blake2b256)?)
+        let cid = self.block_store.put_cbor(&self.root, Code::Blake2b256)?;
+        self.flushed_cid = Some(cid);
+        Ok(cid)
     }
 
     /// Iterates over each value in the Amt and runs a function on the values.
@@ -340,16 +407,19 @@ where
     {
         #[cfg(not(feature = "go-interop"))]
         {
-            self.root
-                .node
-                .for_each_while_mut(
-                    &self.block_store,
-                    self.height(),
-                    self.bit_width(),
-                    0,
-                    &mut f,
-                )
-                .map(|_| ())
+            let (_, did_mutate) = self.root.node.for_each_while_mut(
+                &self.block_store,
+                self.height(),
+                self.bit_width(),
+                0,
+                &mut f,
+            )?;
+
+            if did_mutate {
+                self.flushed_cid = None;
+            }
+
+            Ok(())
         }
 
         // TODO remove requirement for this when/if changed in go-implementation
@@ -359,7 +429,7 @@ where
         // change, and since it should not be feasibly triggered, it's left as this for now.
         #[cfg(feature = "go-interop")]
         {
-            let mut mutated = ahash::AHashMap::new();
+            let mut mutated = Vec::new();
 
             self.root.node.for_each_while_mut(
                 &self.block_store,
@@ -375,14 +445,14 @@ where
                         // which we cannot do because it is memory unsafe (and I'm not certain we
                         // don't have side effects from doing this unsafely)
                         value.mark_unchanged();
-                        mutated.insert(idx, value.clone());
+                        mutated.push((idx, value.clone()));
                     }
 
                     Ok(keep_going)
                 },
             )?;
 
-            for (i, v) in mutated.into_iter() {
+            for (i, v) in mutated {
                 self.set(i, v)?;
             }
 

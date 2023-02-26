@@ -1,3 +1,4 @@
+// Copyright 2021-2023 Protocol Labs
 // Copyright 2019-2022 ChainSafe Systems
 // SPDX-License-Identifier: Apache-2.0, MIT
 
@@ -76,16 +77,34 @@ fn intersection(c: &mut Criterion) {
     c.bench_function("intersection", |b| b.iter(|| &bf1 & &bf2));
 }
 
+fn intersection_empty(c: &mut Criterion) {
+    let bf1 = example1();
+    let bf2 = BitField::new();
+    c.bench_function("intersection_empty", |b| b.iter(|| &bf1 & &bf2));
+}
+
 fn union(c: &mut Criterion) {
     let bf1 = example1();
     let bf2 = example2();
     c.bench_function("union", |b| b.iter(|| &bf1 | &bf2));
 }
 
+fn union_empty(c: &mut Criterion) {
+    let bf1 = example1();
+    let bf2 = BitField::new();
+    c.bench_function("union_empty", |b| b.iter(|| &bf1 | &bf2));
+}
+
 fn difference(c: &mut Criterion) {
     let bf1 = example1();
     let bf2 = example2();
     c.bench_function("difference", |b| b.iter(|| &bf1 - &bf2));
+}
+
+fn difference_empty(c: &mut Criterion) {
+    let bf1 = example1();
+    let bf2 = BitField::new();
+    c.bench_function("difference_empty", |b| b.iter(|| &bf1 - &bf2));
 }
 
 fn symmetric_difference(c: &mut Criterion) {
@@ -133,8 +152,11 @@ criterion_group!(
         from_ranges,
         is_empty,
         intersection,
+        intersection_empty,
         union,
+        union_empty,
         difference,
+        difference_empty,
         symmetric_difference,
         cut,
         contains_all,

@@ -1,9 +1,10 @@
+// Copyright 2021-2023 Protocol Labs
 // Copyright 2019-2022 ChainSafe Systems
 // SPDX-License-Identifier: Apache-2.0, MIT
 
 use std::fmt::Debug;
 
-use fvm_ipld_amt::{Amt, Error, MAX_INDEX};
+use fvm_ipld_amt::{Amt, Amtv0, Error, MAX_INDEX};
 use fvm_ipld_blockstore::tracking::{BSStats, TrackingBlockstore};
 use fvm_ipld_blockstore::{Blockstore, MemoryBlockstore};
 use fvm_ipld_encoding::de::DeserializeOwned;
@@ -11,6 +12,14 @@ use fvm_ipld_encoding::ser::Serialize;
 use fvm_ipld_encoding::BytesDe;
 
 fn assert_get<V, BS>(a: &Amt<V, BS>, i: u64, v: &V)
+where
+    V: Serialize + DeserializeOwned + PartialEq + Debug,
+    BS: Blockstore,
+{
+    assert_eq!(a.get(i).unwrap().unwrap(), v);
+}
+
+fn assert_v0_get<V, BS>(a: &Amtv0<V, BS>, i: u64, v: &V)
 where
     V: Serialize + DeserializeOwned + PartialEq + Debug,
     BS: Blockstore,
@@ -39,7 +48,31 @@ fn basic_get_set() {
         "bafy2bzacedv5uu5za6oqtnozjvju5lhbgaybayzhw4txiojw7hd47ktgbv5wc"
     );
     #[rustfmt::skip]
-    assert_eq!(*db.stats.borrow(), BSStats {r: 1, w: 2, br: 13, bw: 26});
+    assert_eq!(*db.stats.borrow(), BSStats {r: 1, w: 1, br: 13, bw: 13});
+}
+
+#[test]
+fn legacy_amtv0_basic_get_set() {
+    let mem = MemoryBlockstore::default();
+    let db = TrackingBlockstore::new(&mem);
+    let mut a = Amtv0::new(&db);
+
+    a.set(2, tbytes(b"foo")).unwrap();
+    assert_v0_get(&a, 2, &tbytes(b"foo"));
+    assert_eq!(a.count(), 1);
+
+    let c = a.flush().unwrap();
+
+    let new_amt = Amtv0::load(&c, &db).unwrap();
+    assert_v0_get(&new_amt, 2, &tbytes(b"foo"));
+    let c = a.flush().unwrap();
+
+    assert_eq!(
+        c.to_string().as_str(),
+        "bafy2bzaceansvim5z2rzifilsbzsjuoul2adx7iad7x3b4paj3qsexqf6ovxk"
+    );
+    #[rustfmt::skip]
+    assert_eq!(*db.stats.borrow(), BSStats {r: 1, w: 1, br: 12, bw: 12});
 }
 
 #[test]
@@ -423,4 +456,21 @@ fn delete_bug_test() {
 
 fn tbytes(bz: &[u8]) -> BytesDe {
     BytesDe(bz.to_vec())
+}
+
+#[test]
+fn new_from_iter() {
+    let mem = MemoryBlockstore::default();
+    let data: Vec<String> = (0..1000).map(|i| format!("thing{i}")).collect();
+    let k = Amt::<&str, _>::new_from_iter(&mem, data.iter().map(|s| &**s)).unwrap();
+
+    let a: Amt<String, _> = Amt::load(&k, &mem).unwrap();
+    let mut restored = Vec::new();
+    a.for_each(|k, v| {
+        restored.push((k as usize, v.clone()));
+        Ok(())
+    })
+    .unwrap();
+    let expected: Vec<_> = data.into_iter().enumerate().collect();
+    assert_eq!(expected, restored);
 }

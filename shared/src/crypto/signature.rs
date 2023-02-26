@@ -1,3 +1,4 @@
+// Copyright 2021-2023 Protocol Labs
 // Copyright 2019-2022 ChainSafe Systems
 // SPDX-License-Identifier: Apache-2.0, MIT
 
@@ -5,7 +6,7 @@ use std::borrow::Cow;
 use std::error;
 
 use fvm_ipld_encoding::repr::*;
-use fvm_ipld_encoding::{de, ser, serde_bytes, Cbor, Error as EncodingError};
+use fvm_ipld_encoding::{de, ser, strict_bytes, Error as EncodingError};
 use num_derive::FromPrimitive;
 use num_traits::FromPrimitive;
 use thiserror::Error;
@@ -41,8 +42,6 @@ pub struct Signature {
     pub bytes: Vec<u8>,
 }
 
-impl Cbor for Signature {}
-
 impl ser::Serialize for Signature {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -53,7 +52,7 @@ impl ser::Serialize for Signature {
         bytes.push(self.sig_type as u8);
         bytes.extend_from_slice(&self.bytes);
 
-        serde_bytes::Serialize::serialize(&bytes, serializer)
+        strict_bytes::Serialize::serialize(&bytes, serializer)
     }
 }
 
@@ -62,7 +61,7 @@ impl<'de> de::Deserialize<'de> for Signature {
     where
         D: de::Deserializer<'de>,
     {
-        let bytes: Cow<'de, [u8]> = serde_bytes::Deserialize::deserialize(deserializer)?;
+        let bytes: Cow<'de, [u8]> = strict_bytes::Deserialize::deserialize(deserializer)?;
         if bytes.is_empty() {
             return Err(de::Error::custom("Cannot deserialize empty bytes"));
         }
@@ -103,6 +102,27 @@ impl Signature {
     /// Returns [SignatureType] for the signature.
     pub fn signature_type(&self) -> SignatureType {
         self.sig_type
+    }
+}
+
+#[cfg(feature = "arb")]
+impl quickcheck::Arbitrary for SignatureType {
+    fn arbitrary(g: &mut quickcheck::Gen) -> Self {
+        if bool::arbitrary(g) {
+            SignatureType::Secp256k1
+        } else {
+            SignatureType::BLS
+        }
+    }
+}
+
+#[cfg(feature = "arb")]
+impl quickcheck::Arbitrary for Signature {
+    fn arbitrary(g: &mut quickcheck::Gen) -> Self {
+        Self {
+            bytes: Vec::arbitrary(g),
+            sig_type: SignatureType::arbitrary(g),
+        }
     }
 }
 
@@ -208,6 +228,7 @@ pub mod ops {
             Err("Secp signature verification failed".to_owned())
         }
     }
+
     /// Aggregates and verifies bls signatures collectively.
     pub fn verify_bls_aggregate(
         data: &[&[u8]],
@@ -376,7 +397,7 @@ mod tests {
 }
 
 /// Crypto error
-#[derive(Debug, PartialEq, Error)]
+#[derive(Debug, PartialEq, Eq, Error)]
 pub enum Error {
     /// Failed to produce a signature
     #[error("Failed to sign data {0}")]
